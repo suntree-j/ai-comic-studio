@@ -8,9 +8,10 @@
 —— 用 **12 条业务规则 + 自修复循环** 解决 AI 生成漫画的
 **一致性 / 可编辑性 / 可复现性** 三大难题
 
-[![tests](https://img.shields.io/badge/tests-121%20passed-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-166%20passed-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
+[![demo](https://img.shields.io/badge/🌐_在线_Demo-36.151.150.140%2Fcomic-4a9eff)](http://36.151.150.140/comic/)
 
 </div>
 

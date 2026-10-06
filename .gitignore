@@ -35,7 +35,10 @@ examples/**/assets/
 .env.*
 !.env.example
 *.key
+*.pem
+*.ppk
 secrets.json
+credentials.json
 
 # 编辑器
 .vscode/
