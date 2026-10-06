@@ -110,23 +110,27 @@ python -m packages.cli rules      # 查看全部规则
 
 ## 快速开始
 
-### 离线演示（不需要 API key）
+### 端到端演示（不需要任何 API key）
 
 ```bash
 git clone <repo> && cd ai-comic-studio
-pip install -e .
+pip install -e ".[dev]"
 
-python examples/minimal/run_mock.py
+# 小说 → IR（含自修复）→ 校验 → 渲染 → PDF + 长图
+python examples/minimal/run_full.py
 ```
 
 输出：
 
 ```
-▶ 处理第 2436 章《冰晶刹弓》（191 字）
-   [repair] 第 1 轮失败：1 个错误 ['IR-002']
+【阶段 1】小说 → Comic IR
+   [repair] 第 1 轮失败：1 个错误 ['IR-002']     ← 两人同框没写距离
    [repair] 第 2 轮通过
-   分镜：1 章 / 2 格   对白：2 条   页数：4
-   项目级校验：校验通过
+   章节状态：repaired（3 轮）
+【阶段 2】IR 校验      校验通过
+【阶段 3】渲染 → PDF   出图 2 张｜合成 4 页
+  📄 out/comic.pdf       214 KB
+  🖼 out/longs/长图_1.jpg
 ```
 
 ### 真实使用
@@ -143,11 +147,23 @@ python -m packages.cli adapt 原文/2436.txt \
 python -m packages.cli validate project/ --source 原文/2436.txt
 ```
 
-### 支持任意 OpenAI 兼容服务
+```python
+# 4. 渲染（任选生图服务）
+from packages.ir import Bible, ComicProject
+from packages.render import get_image_provider, RenderStudio
+
+project = load_project("project/")
+studio = RenderStudio(get_image_provider("seedream", api_key="..."))
+studio.render(project, "assets/", "comic.pdf")
+```
+
+### 支持任意 OpenAI 兼容服务与任意生图服务
 
 ```bash
 python -m packages.cli providers
-#   openai / deepseek / moonshot / dashscope / ollama / mock
+# LLM：openai / deepseek / moonshot / dashscope / ollama / mock
+
+# 生图：mock / seedream / openai / sd-webui / generic-http
 
 # 本地模型也行
 python -m packages.cli adapt 原文.txt --bible bible.json --out out/ \
@@ -169,9 +185,16 @@ ai-comic-studio/
 │   │   ├── prompts.py           提示词模板（规则前置 + 引用式）
 │   │   ├── skills.py            5 个技能 + 自修复循环
 │   │   └── pipeline.py          端到端编排
+│   ├── render/              ★ 渲染引擎
+│   │   ├── providers.py         生图适配器（Seedream / OpenAI / SD / Mock / 通用 HTTP）
+│   │   ├── prompt.py            三段式提示词组装 + 硬规则注入
+│   │   ├── bubble.py            气泡布局算法（内容能量最小化）
+│   │   ├── page.py              页面合成
+│   │   ├── export.py            PDF / 长图导出
+│   │   └── studio.py            渲染编排
 │   └── cli.py               命令行
-├── tests/                   51 个测试
-├── examples/minimal/        最小可运行示例
+├── tests/                   75 个测试
+├── examples/minimal/        最小可运行示例（含端到端出 PDF）
 ├── docs/
 │   ├── design.md            完整方案与架构
 │   └── roadmap.md           路线图

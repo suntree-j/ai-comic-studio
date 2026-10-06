@@ -62,28 +62,45 @@ python -m packages.cli storyboard 原文/2436.txt --bible project/bible.json
 
 ---
 
-## Phase 3 · 渲染层
+## Phase 3 · 渲染层  ✅ 已完成
 
-- [ ] `packages/render/prompt.py` — 三段式提示词组装器
-- [ ] `packages/render/providers/` — 图像服务抽象
-      （Seedream / 兼容 OpenAI Images / SD WebUI / 本地 mock）
-- [ ] `packages/render/bubble.py` — 气泡放置算法
-      - 内容能量最小化（避开人物）
-      - 说话人反侧判定
-      - 同格多气泡分侧 + ≥5 个竖排
-- [ ] `packages/render/page.py` — 页面合成
-- [ ] `packages/render/export.py` — PDF / 长图导出
-- [ ] `tests/test_bubble.py` — 气泡算法的 Golden 测试
+- [x] `packages/render/providers.py` — 生图 Provider 抽象
+      · `MockImageProvider`    离线占位图（测试/Demo，无需 key）
+      · `SeedreamProvider`     火山方舟
+      · `OpenAIImagesProvider` OpenAI Images
+      · `SDWebUIProvider`      本地 SD WebUI (A1111)
+      · `GenericHTTPProvider`  任意 HTTP 接口（用配置描述）
+      · 额度超限识别（`QuotaExceeded`）便于暂停重试
+- [x] `packages/render/prompt.py` — 三段式提示词组装
+      · 共享风格块 + 角色标准块（逐字）+ 本格构图 + 禁止文字
+      · 硬规则注入：极远景 / 双人距离 / 战斗形态 / 变身保脸 / 损伤分级
+      · 角色当前伤情自动写入提示词
+- [x] `packages/render/bubble.py` — 气泡布局算法
+      · 内容能量最小化（色彩差异 + 边缘梯度）
+      · 人物左右检测（肤色+深色+红色，排除雪白背景）
+      · 说话人反侧偏置 / 分侧硬约束 / ≥5 个竖排 / 避让已放置
+      · 默认箭头指向（画外音指向画面空白）
+- [x] `packages/render/page.py` — 页面合成
+      · 单格统一宽 2480 / 目标页高 3450 / 格间距 26
+      · 6 种气泡样式（含尖角喊叫、方框旁白）
+      · 技能名标签（10 种属性配色）
+      · 自动分页（末页过薄自动并入）
+- [x] `packages/render/export.py` — PDF / 长图导出
+      · PDF（Pillow 或 PyMuPDF）
+      · 长图（单张 + 切成 N 张便于发送）
+- [x] `packages/render/studio.py` — 渲染编排（出图→合成→导出，带缓存）
+- [x] `tests/test_render.py` — 24 个测试
+- [x] `examples/minimal/run_full.py` — 端到端演示（完全离线出 PDF）
 
 **验收**：
 ```bash
-python -m packages.cli render project/ --out comic.pdf
-# → 从 IR + 素材产出完整 PDF
+python examples/minimal/run_full.py
+# 小说 → IR（含自修复）→ 校验 → 渲染 → comic.pdf + 长图
 ```
 
 ---
 
-## Phase 4 · 工作台（展示门面）
+## Phase 4 · 工作台（展示门面）  下一步
 
 - [ ] `apps/workbench/` — React + TS + Vite + Konva
   - 分镜条（缩略图 + 拖拽排序）
@@ -127,14 +144,14 @@ python -m packages.cli render project/ --out comic.pdf
 
 ## 里程碑时间估算
 
-| Phase | 内容 | 估时 |
-|---|---|---|
-| 1 | IR 层 | ✅ 完成 |
-| 2 | Agent 层 | 2–3 周 |
-| 3 | 渲染层 | 1–2 周 |
-| 4 | 工作台 | 2–3 周 |
-| 5 | 打包展示 | 1 周 |
-| | **合计** | **6–9 周** |
+| Phase | 内容 | 估时 | 状态 |
+|---|---|---|---|
+| 1 | IR 层 | — | ✅ 完成 |
+| 2 | Agent 层 | — | ✅ 完成 |
+| 3 | 渲染层 | — | ✅ 完成 |
+| 4 | 工作台 | 2–3 周 | 下一步 |
+| 5 | 打包展示 | 1 周 | |
+| | **剩余** | **3–4 周** | |
 
 ---
 
