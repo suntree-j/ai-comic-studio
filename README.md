@@ -266,10 +266,11 @@ ai-comic-studio/
 │   ├── roadmap.md           路线图
 │   └── images/              演示截图
 ├── scripts/
+│   ├── e2e_check.py              ★ 端到端验收（25 项，一条命令）
 │   ├── make_demo_project.py      一键生成示例项目
 │   ├── make_showcase_project.py  用真实素材生成展示项目
-│   ├── make_graphics.py          生成 README 演示图
-│   ├── shoot.py                  headless 截图
+│   ├── make_graphics.py          生成 README 演示对比图
+│   ├── shoot_ui.py               headless 截图（按文件大小确认加载完成）
 │   └── smoke_api.py              API 冒烟测试
 ├── Dockerfile
 └── docker-compose.yml
@@ -281,8 +282,28 @@ ai-comic-studio/
 
 ```bash
 pytest -q
-# 121 passed
+# 129 passed
 ```
+
+### 端到端验收（一条命令跑通全部流程）
+
+```bash
+python scripts/e2e_check.py
+```
+
+```
+① 单元测试              129 passed
+② 小说 → IR → PDF       生成 PDF 214 KB ｜ 自修复被触发 ｜ 长图 2 张
+③ 生成示例项目          demo / showcase 四个 IR 文件齐全
+④ 工作台 API（真实 HTTP） 10 个接口全部 200
+⑤ 编辑闭环              PATCH 气泡 → 重渲染画面确实变化 ｜ 换说话人自动取消确认
+⑥ 导出                  PDF 魔数 %PDF ｜ 长图 3 张
+⑦ 前端静态检查          app.js 语法 OK ｜ README 图链完整
+
+25/25 项通过
+```
+
+### 测试覆盖
 
 | 测试文件 | 数量 | 覆盖 |
 |---|---|---|
