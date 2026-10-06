@@ -1,41 +1,49 @@
+<div align="center">
+
 # AI Comic Studio
 
-> **把小说自动改编成漫画的可复用开源方案。**
-> 核心：定义一个受 Schema 约束的 **Comic IR**（漫画中间表示），
-> 让 LLM 只负责创作决策、确定性引擎负责渲染 —— 从而解决 AI 生成漫画的
-> **一致性、可编辑性与可复现性** 三大难题。
+**把小说自动改编成漫画的可复用开源方案**
+
+定义受 Schema 约束的 **Comic IR**，让 LLM 只做创作决策、确定性引擎负责渲染
+—— 用 **12 条业务规则 + 自修复循环** 解决 AI 生成漫画的
+**一致性 / 可编辑性 / 可复现性** 三大难题
+
+[![tests](https://img.shields.io/badge/tests-121%20passed-brightgreen)]()
+[![python](https://img.shields.io/badge/python-3.10%2B-blue)]()
+[![license](https://img.shields.io/badge/license-MIT-green)]()
+
+</div>
+
+---
+
+## 问题：直接让 AI 画漫画，有三个必死问题
+
+| 问题 | 现象 |
+|---|---|
+| **一致性崩溃** | 同一角色第 3 格换发色、第 8 格换衣服 |
+| **不可控** | 想改一句台词，要重出整页图（90 秒/格） |
+| **不可复现** | 同样输入两次，结果完全不同 |
+
+---
+
+## 解法：类比 Text-to-SQL，把「生成」拆成「决策」与「渲染」
+
+- 不让 LLM 直接查数据库，而是让它产出 **SQL**（受 schema 约束的中间层）
+- 不让 LLM 直接画漫画，而是让它产出 **Comic IR**（受 schema 约束的中间层）
 
 ```
 小说文本 ──[AI 改漫 Agent]──▶ Comic IR ──[渲染引擎]──▶ 漫画 PDF
                                  ▲
                                  │
-                         [可视化工作台] 人工微调
+                        [可视化工作台] 人工微调
 ```
-
----
-
-## 为什么需要它
-
-### 直接让 AI 画漫画，有三个必死问题
-
-| 问题 | 现象 |
-|---|---|
-| **一致性崩溃** | 同一角色第 3 格换发色、第 8 格换衣服 |
-| **不可控** | 想改一句台词，要重出整页图 |
-| **不可复现** | 同样输入两次，结果完全不同 |
-
-### 我们的解法：把「生成」拆成「决策」与「渲染」
-
-**类比 Text-to-SQL**：
-- 不让 LLM 直接查数据库，而是让它产出 **SQL**（受 schema 约束的中间层）
-- 不让 LLM 直接画漫画，而是让它产出 **Comic IR**（受 schema 约束的中间层）
 
 **收益**：
 
-- ✅ **可校验** —— IR 有 12 条业务规则，渲染前就能发现 90% 的错误
+- ✅ **可校验** —— 12 条业务规则，渲染前就能发现 90% 的错误
 - ✅ **可修复** —— 校验失败自动把结构化错误回喂给 LLM（Self-Repair）
 - ✅ **可编辑** —— 改 IR 一句话 → 3 秒重渲染，不用重出图
-- ✅ **可复现** —— 同 IR + 同素材 → 同输出
+- ✅ **可复现** —— 同 IR + 同素材 → 逐像素一致
 
 ---
 
@@ -53,7 +61,7 @@ project/
 
 | 设计 | 为什么 |
 |---|---|
-| **引用而非内联** | `cast` 只写 `character_id`，外观从 bible 取 → 不可能出现「这格换了衣服」 |
+| **引用而非内联** | `cast` 只写 `character_id`，外观从 bible 取 → **不可能出现「这格换了衣服」**，因为根本没有第二个地方能定义外观 |
 | **状态外置** | 角色伤情/服装在 bible 里跨格追踪 → 长程一致性有据可依 |
 | **可追溯** | 对白带 `source_span` 指回原文行号 → 校验器能抓出 LLM 编造的台词 |
 | **页码冻结** | 删除某格只标 `empty`，其余页码不动 → 协作时「第 78 页」永远指同一页 |
@@ -74,7 +82,7 @@ JSON Schema 只能挡格式错误，挡不住「格式正确但语义错误」�
 | **IR-004** | 主角损伤等级不得无故回落 | 否则伤口自愈 |
 | **IR-005** | 伤情必须闭环（有起始镜头/愈合镜头） | 否则连续性断裂 |
 | **IR-006** | 对白引用合法且说话人已确认 | 防止张冠李戴 |
-| **IR-007** | 对白必须能在原文里逐字找到 | ★ 防 LLM 编造台词 |
+| **IR-007** | 对白必须能在原文里逐字找到 | ★ **防 LLM 编造台词** |
 | **IR-008** | 气泡与箭头坐标不得重合或越界 | 否则指向错误 |
 | **IR-009** | 页序引用的镜头必须存在且不重复 | 防错位 |
 | **IR-010** | 每个镜头都必须被排进页面 | 防漏排 |
@@ -99,18 +107,28 @@ python -m packages.cli rules      # 查看全部规则
                     仍失败 → 标记 pending_human（交人工，不硬渲染）
 ```
 
-**实测**（`examples/minimal/run_mock.py`）：
+**实测输出**（`examples/minimal/run_full.py`）：
 
 ```
-[repair] 第 1 轮失败：1 个错误 ['IR-002']     ← 两人同框没写距离
-[repair] 第 2 轮通过
+▶ 处理第 2436 章《冰晶刹弓》（191 字）
+   [repair] 第 1 轮失败：1 个错误 ['IR-002']     ← 两人同框没写距离
+   [repair] 第 2 轮通过
+   章节状态：repaired（3 轮）
+```
+
+错误回喂的内容是**结构化、可操作**的：
+
+```
+- [IR-002] ch2436_P001: 有 2 个角色出场但未写 distance
+  修正方式：写明具体距离，如「两人相距约 8 米，中间大片空旷冰道」；
+            否则模型会把两人画得像在聊天
 ```
 
 ---
 
 ## 快速开始
 
-### 端到端演示（不需要任何 API key）
+### 端到端演示（完全离线，不需要任何 API key）
 
 ```bash
 git clone <repo> && cd ai-comic-studio
@@ -120,55 +138,62 @@ pip install -e ".[dev]"
 python examples/minimal/run_full.py
 ```
 
-输出：
-
-```
-【阶段 1】小说 → Comic IR
-   [repair] 第 1 轮失败：1 个错误 ['IR-002']     ← 两人同框没写距离
-   [repair] 第 2 轮通过
-   章节状态：repaired（3 轮）
-【阶段 2】IR 校验      校验通过
-【阶段 3】渲染 → PDF   出图 2 张｜合成 4 页
-  📄 out/comic.pdf       214 KB
-  🖼 out/longs/长图_1.jpg
-```
-
-### 真实使用
+### 可视化工作台
 
 ```bash
-# 1. 准备 bible.json（角色/场景/风格的标准块）
-# 2. 跑 Agent：小说 → Comic IR
-export DEEPSEEK_API_KEY=sk-...
-python -m packages.cli adapt 原文/2436.txt \
-    --bible examples/minimal/bible.json \
-    --out project/ --chapters 1 --panels 10
-
-# 3. 校验
-python -m packages.cli validate project/ --source 原文/2436.txt
+python scripts/make_demo_project.py    # 生成示例项目
+python -m apps.api.server --port 8000
+# 打开 http://127.0.0.1:8000
 ```
 
-```python
-# 4. 渲染（任选生图服务）
-from packages.ir import Bible, ComicProject
-from packages.render import get_image_provider, RenderStudio
+工作台可以：**拖拽气泡** → **改说话人** → **调箭头指向** → **一键重渲染** → **导出 PDF**
 
-project = load_project("project/")
-studio = RenderStudio(get_image_provider("seedream", api_key="..."))
-studio.render(project, "assets/", "comic.pdf")
-```
-
-### 支持任意 OpenAI 兼容服务与任意生图服务
+### Docker 一键部署
 
 ```bash
-python -m packages.cli providers
-# LLM：openai / deepseek / moonshot / dashscope / ollama / mock
-
-# 生图：mock / seedream / openai / sd-webui / generic-http
-
-# 本地模型也行
-python -m packages.cli adapt 原文.txt --bible bible.json --out out/ \
-    --provider ollama --base-url http://localhost:11434/v1
+docker compose up -d
+# http://localhost:8000
 ```
+
+---
+
+## 技术亮点
+
+### ① 可插拔，不锁厂商
+
+| 层 | 内置适配器 |
+|---|---|
+| **LLM** | OpenAI / DeepSeek / Moonshot / DashScope / Ollama / Mock |
+| **生图** | Seedream / OpenAI Images / SD WebUI / 通用 HTTP / Mock |
+
+所有外部服务都是适配器 + 工厂，**默认无厂商**。
+本地模型（Ollama / SD WebUI）可直接跑；`Mock` 让测试与 Demo 完全离线。
+
+### ② 气泡布局 = 内容能量最小化
+
+```
+能量 = 0.6 × 与画面中位色的差异 + 0.4 × 边缘梯度
+```
+气泡落在**画面最空、最不打扰人物**的位置。
+
+配 `detect_person_side()`：肤色 + 深色发/衣 + 红色围巾，**排除雪白背景**
+（雪景里不排除的话整幅都是「亮」的，判不出人物在哪）。
+
+### ③ 三段式提示词 + 硬规则自动注入
+
+```
+① 共享风格块（全篇逐字相同）
+② 角色标准块（从 bible 逐字取，绝不改写）
+③ 本格构图（景别/位置/距离/动作/背景/氛围）
+④ 禁止文字（★ 防止对白被画进图里）
+```
+
+按条件自动追加硬规则：极远景 / 双人距离 / 战斗形态 / 变身保脸型瞳色 / 损伤分级。
+
+### ④ 渲染是纯函数
+
+同 IR + 同素材 → **逐像素一致**（有测试保障）。
+带来：可复现、可缓存、可 Golden 测试。
 
 ---
 
@@ -178,39 +203,33 @@ python -m packages.cli adapt 原文.txt --bible bible.json --out out/ \
 ai-comic-studio/
 ├── packages/
 │   ├── ir/                  ★ Comic IR 数据模型 + 12 条规则校验
-│   │   ├── models.py            Pydantic v2 模型
-│   │   └── validator.py         业务规则引擎
 │   ├── agent/               ★ AI 改漫 Agent
-│   │   ├── providers.py         LLM 适配器（可插拔）
+│   │   ├── providers.py         LLM 适配器
 │   │   ├── prompts.py           提示词模板（规则前置 + 引用式）
 │   │   ├── skills.py            5 个技能 + 自修复循环
 │   │   └── pipeline.py          端到端编排
 │   ├── render/              ★ 渲染引擎
-│   │   ├── providers.py         生图适配器（Seedream / OpenAI / SD / Mock / 通用 HTTP）
-│   │   ├── prompt.py            三段式提示词组装 + 硬规则注入
-│   │   ├── bubble.py            气泡布局算法（内容能量最小化）
+│   │   ├── providers.py         生图适配器
+│   │   ├── prompt.py            三段式提示词组装
+│   │   ├── bubble.py            气泡布局算法
 │   │   ├── page.py              页面合成
 │   │   ├── export.py            PDF / 长图导出
 │   │   └── studio.py            渲染编排
 │   └── cli.py               命令行
-├── tests/                   75 个测试
-├── examples/minimal/        最小可运行示例（含端到端出 PDF）
+├── apps/
+│   ├── api/server.py        FastAPI 后端
+│   └── workbench/           可视化工作台（纯静态，零构建）
+├── tests/                   121 个测试
+├── examples/minimal/        最小可运行示例
 ├── docs/
 │   ├── design.md            完整方案与架构
+│   ├── lessons.md           ★ 实战踩坑复盘（五个结构性坑）
+│   ├── workbench.md         工作台说明
 │   └── roadmap.md           路线图
-└── scripts/
+├── scripts/                 示例项目 / 冒烟测试
+├── Dockerfile
+└── docker-compose.yml
 ```
-
----
-
-## 技术亮点（面试可深入）
-
-1. **受约束生成** —— LLM 输出受 JSON Schema + 12 条业务规则双重约束
-2. **自修复循环** —— 校验失败自动回喂结构化错误，而非直接失败
-3. **跨格状态追踪** —— 角色伤情/服装/情绪在 bible 里持续演进
-4. **纯函数渲染** —— 确定性、可缓存、可 Golden 测试
-5. **可插拔架构** —— LLM 与生图服务都是适配器，不锁定厂商
-6. **页码冻结机制** —— 从「删一格导致全书错位」的实战教训中来
 
 ---
 
@@ -218,34 +237,47 @@ ai-comic-studio/
 
 ```bash
 pytest -q
-# 51 passed
+# 121 passed
 ```
 
-覆盖：
-- 12 条规则各自的触发条件（每条都有反例测试）
-- 自修复循环：一轮修复 / 多轮耗尽 / 不可解析输出 / 错误回喂验证
-- 端到端 pipeline：布局生成、页码冻结、pending 降级
-- 状态追踪：新增伤情 / 去重 / 愈合
+| 测试文件 | 数量 | 覆盖 |
+|---|---|---|
+| `test_validator.py` | 26 | 12 条规则各自的反例 + 正确样例必须通过 |
+| `test_agent.py` | 20 | JSON 提取 / 自修复编排 / 错误回喂验证 / 状态追踪 |
+| `test_pipeline.py` | 5 | 端到端编排 / 页码冻结 / pending 降级 |
+| `test_bubble.py` | 17 | 人物检测 / 避让 / 分侧 / 竖排不重叠 / 确定性 |
+| `test_render.py` | 24 | 提示词三段 / Mock provider / 合成 / 导出 / 逐像素可复现 |
+| `test_api.py` | 30 | 全部接口 + 编辑落盘 + 路径穿越防护 + **无改页码接口** |
 
 ---
 
-## 实战验证
+## 实战来源
 
 本项目源于一次真实产出：**《全职法师》2426–2445 章改编，20 章 / 168 页 / 216 格**。
-那次项目用散落脚本 + 人工校验完成，踩了五个结构性坑（对白烧进图、页码中途变动、
-四层索引、改动只在图里、无阶段自检）—— **本项目的设计正是这些坑的解法**。
+
+那次项目用散落脚本 + 人工校验完成，踩了五个结构性坑：
+
+1. **对白烧进图片** → 改一句话要重出整页图
+2. **页码中途变动** → 删一格导致全书错位，3 轮沟通无法对齐
+3. **四层索引互相打架** → 任何一层不同步就出错图
+4. **改动只在图里** → 项目一删，全部对白数据永久丢失
+5. **没有阶段自检** → 出到第 100 格才发现前 30 格全错
+
+**本项目的架构与 12 条规则，就是这五个坑的解法。**
+详见 [`docs/lessons.md`](docs/lessons.md)
 
 ---
 
 ## 路线图
 
-- [x] **Phase 1 · IR 层** —— 数据模型 + 12 条规则 + 51 测试
-- [x] **Phase 2 · Agent 层** —— Provider 抽象 + 提示词 + 5 技能 + 自修复 + CLI
-- [ ] **Phase 3 · 渲染层** —— 提示词组装 + 生图适配 + 气泡算法 + PDF 导出
-- [ ] **Phase 4 · 工作台** —— React 可视化编辑（拖气泡 / 调箭头 / 一键重渲染）
-- [ ] **Phase 5 · 部署** —— Docker Compose + 在线 Demo
+- [x] **Phase 1 · IR 层** —— 数据模型 + 12 条规则
+- [x] **Phase 2 · Agent 层** —— Provider 抽象 + 提示词 + 5 技能 + 自修复
+- [x] **Phase 3 · 渲染层** —— 生图适配 + 提示词组装 + 气泡算法 + PDF
+- [x] **Phase 4 · 工作台** —— FastAPI + 可视化编辑
+- [x] **Phase 5 · 部署** —— Docker + 示例项目
+- [ ] 更多：多语言 / 条漫模式 / 协作 / 版本 diff
 
-详见 [docs/roadmap.md](docs/roadmap.md)
+详见 [`docs/roadmap.md`](docs/roadmap.md)
 
 ---
 

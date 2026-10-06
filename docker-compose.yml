@@ -1,0 +1,30 @@
+# AI Comic Studio · 一键部署
+#
+#   docker compose up -d
+#   → http://localhost:8000
+#
+# 默认用 mock 生图服务（无需任何 key），可以直接浏览示例项目与工作台。
+# 要接真实生图服务，改 COMIC_IMAGE_PROVIDER 与对应 key。
+
+services:
+  studio:
+    build: .
+    image: ai-comic-studio:latest
+    container_name: ai-comic-studio
+    ports:
+      - "8000:8000"
+    environment:
+      # 生图服务：mock / seedream / openai / sd-webui / generic-http
+      COMIC_IMAGE_PROVIDER: ${COMIC_IMAGE_PROVIDER:-mock}
+      # 接真实服务时把对应 key 填进 .env
+      ARK_API_KEY: ${ARK_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      COMIC_PROJECTS: /data/projects
+    volumes:
+      # 项目数据持久化（IR 文件、素材、导出产物）
+      - comic-projects:/data/projects
+    restart: unless-stopped
+
+volumes:
+  comic-projects:
