@@ -1,0 +1,53 @@
+feat: 部署到京东云服务器 + 修三个「只有上服务器才暴露」的坑
+
+## 在线 Demo 已上线
+    http://36.151.150.140/comic/
+    京东云 4核16G Ubuntu 24.04，venv + systemd(127.0.0.1:8500) + Nginx 子路径
+    该服务器同时跑着 data-platform 生产系统（Doris/Airflow/MinIO 等 11 个容器），
+    本应用只追加 location /comic/，不覆盖任何现有配置，改动前先备份 data-platform.conf
+
+## 子路径部署支持
+- 服务端新增 --base-path / COMIC_BASE_PATH，把 <base href> 注入 HTML
+- 前端 API 前缀从 <base> 推导（新增 url() 函数），图片也走它
+- index.html 静态资源改相对路径
+- 路径链：
+    浏览器 /comic/
+    -> 服务端注入 <base href="/comic/">
+    -> HTML 里 "static/app.js" 解析为 /comic/static/app.js
+    -> nginx proxy_pass 带尾斜杠剥掉前缀
+    -> 应用收到 /static/app.js -> StaticFiles 命中 apps/workbench/app.js
+- 踩坑：uvicorn.run 传「模块:app」字符串会重新导入模块，
+  把 BASE_PATH 重置回默认值 -> 改为直接传 app 对象
+
+## 修三个「本地全绿、部署才炸」的坑
+
+1. 缺 numpy：服务启动即 ModuleNotFoundError。
+   pyproject.toml 漏声明（bubble.py 用到），本地早装好所以没暴露。
+   -> 补依赖；新增 test_packaging.py 静态检查「所有第三方 import 都已声明」
+   顺带发现 packages 手写列表漏了 packages.render -> 改用 packages.find 自动发现
+
+2. 缺中文字体：气泡中文全变方块，但接口返回 200、图片正常生成。
+   服务器只有 DejaVu；旧 load_font 找不到中文字体就静默回落 load_default()。
+   -> load_font 改为大声发 RuntimeWarning
+      候选路径扩到 glob 兜底 + COMIC_FONT 环境变量
+      部署脚本自动 apt install fonts-wqy-microhei 并单独验证这一项
+
+3. 字体探测失效：装了字体仍被判「不含中文」。
+   _has_cjk 用 mask.tobytes()，Pillow 12.3 移除了该 API，异常被吞 ->
+   所有字体都判 False。改 getbbox() 后实测发现纯拉丁字体对缺失字形
+   也返回非空 bbox（arial/consola/tahoma 全 5/5），依然错。
+   -> 最终改为查 cmap（fontTools），fonttools 升为必需依赖
+      没有 fontTools 时返回 False（宁可误报找不到并发警告，也不要默默出方块）
+
+## 新增测试（154 passed，从 138 增加）
+- test_fonts.py     12 项：字体检测两条分支、拒绝拉丁字体、渲染墨迹、缓存、
+                          缺字体必须警告、防 Pillow API 变更回归
+- test_subpath.py    8 项：<base> 注入归一化、静态资源挂载、接口前缀、
+                          uvicorn 重导入坑
+- test_packaging.py  3 项：依赖声明一致性、extras 覆盖、包发现
+
+## 工具
+- scripts/deploy_remote.py   一键部署（准备 -> 上传 -> systemd -> Nginx -> 验证 9 项）
+- scripts/check_subpath.py   本地模拟子路径模式
+- docs/deploy.md             补「生产实况」章节：路径推导链 + 三个坑的完整复盘
+- docs/images/deployed.png   线上实拍截图

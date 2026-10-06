@@ -4,7 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Comic Studio · 漫画工作台</title>
-<link rel="stylesheet" href="/static/style.css">
+<!-- 服务端会注入 <base href="...">（如 /comic/）。
+     应用把 /static 映射到本目录，静态文件放在 static/ 下。
+     <base href="/comic/"> + "static/app.js"  →  /comic/static/app.js
+     nginx proxy_pass 带尾斜杠剥掉 /comic   →  应用收到 /static/app.js  ✓ -->
+<link rel="stylesheet" href="static/style.css">
 </head>
 <body>
 <header class="topbar">
@@ -62,6 +66,6 @@
 
 <div id="toast" class="toast"></div>
 
-<script src="/static/app.js"></script>
+<script src="static/app.js"></script>
 </body>
 </html>

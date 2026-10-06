@@ -57,6 +57,8 @@ from packages.render import (
 HERE = Path(__file__).resolve().parent
 WORKBENCH_DIR = HERE.parent / "workbench"
 PROJECTS_DIR = Path(os.environ.get("COMIC_PROJECTS", HERE.parent.parent / "projects"))
+#: 挂载在反向代理的子路径下时（如 /comic/），静态资源要用相对路径引用
+BASE_PATH = os.environ.get("COMIC_BASE_PATH", "/")
 
 app = FastAPI(title="AI Comic Studio API", version="0.1.0")
 app.add_middleware(
@@ -200,7 +202,14 @@ class PanelPatch(BaseModel):
 @app.get("/api/health")
 def health():
     return {"ok": True, "provider": _provider_name,
-            "providers": IMAGE_PROVIDER_NAMES}
+            "providers": IMAGE_PROVIDER_NAMES,
+            "base_path": BASE_PATH}
+
+
+@app.get("/api/config")
+def get_config():
+    """给前端读的运行时配置（子路径部署时前端据此拼接口地址）"""
+    return {"base_path": BASE_PATH, "version": app.version}
 
 
 @app.get("/api/projects")
@@ -498,7 +507,12 @@ def download(name: str, rest: str):
 if WORKBENCH_DIR.exists():
     @app.get("/")
     def index():
-        return FileResponse(str(WORKBENCH_DIR / "index.html"))
+        # 把 BASE_PATH 注入 <base>，让前端在任何子路径下都能正确加载资源
+        html = (WORKBENCH_DIR / "index.html").read_text(encoding="utf-8")
+        bp = BASE_PATH if BASE_PATH.endswith("/") else BASE_PATH + "/"
+        if "<head>" in html:
+            html = html.replace("<head>", f'<head>\n<base href="{bp}">', 1)
+        return Response(html, media_type="text/html; charset=utf-8")
 
     app.mount("/static", StaticFiles(directory=str(WORKBENCH_DIR)), name="static")
 else:                                                       # pragma: no cover
@@ -508,7 +522,7 @@ else:                                                       # pragma: no cover
 
 
 def main(argv=None) -> int:                                 # pragma: no cover
-    global _provider_name
+    global _provider_name, BASE_PATH
 
     import argparse
     import uvicorn
@@ -516,14 +530,19 @@ def main(argv=None) -> int:                                 # pragma: no cover
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--provider", default=_provider_name)
+    ap.add_argument("--base-path", default=BASE_PATH)
     ap.add_argument("--reload", action="store_true")
     a = ap.parse_args(argv)
 
     _provider_name = a.provider
+    BASE_PATH = a.base_path
+    os.environ["COMIC_BASE_PATH"] = BASE_PATH
     PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"  AI Comic Studio 工作台 → http://{a.host}:{a.port}")
+    print(f"  AI Comic Studio 工作台 → http://{a.host}:{a.port}{BASE_PATH}")
     print(f"  生图 provider: {a.provider}｜项目目录: {PROJECTS_DIR}")
-    uvicorn.run("apps.api.server:app", host=a.host, port=a.port, reload=a.reload)
+    # ★ 传 app 对象而不是 "模块:app" 字符串 —— 后者会让 uvicorn 重新导入模块，
+    #   把上面设好的全局变量（BASE_PATH / _provider_name）重置回默认值。
+    uvicorn.run(app, host=a.host, port=a.port, reload=a.reload)
     return 0
 
 

@@ -8,7 +8,16 @@
  */
 'use strict';
 
-const API = '';
+/* API 前缀：支持挂在反向代理子路径下（如 /comic/）。
+ * 由 index.html 里的 <base href> 决定；服务端没注入时回落到根路径。 */
+const API = (function () {
+  try {
+    const b = document.querySelector('base');
+    let href = b ? (b.getAttribute('href') || '/') : '/';
+    return href.endsWith('/') ? href : href + '/';
+  } catch (e) { return '/'; }
+})();
+
 const S = {
   project: null,      // 项目数据
   page: 1,            // 当前页
@@ -25,8 +34,15 @@ const el = (t, c, h) => {
   return n;
 };
 
+/** 把「以 / 开头的应用内路径」拼到部署前缀之后
+ *  例：前缀 /comic/  +  /api/projects  →  /comic/api/projects */
+function url(p) {
+  if (/^https?:\/\//.test(p)) return p;
+  return API + String(p).replace(/^\/+/, '');
+}
+
 async function api(path, opt) {
-  const r = await fetch(API + path, opt);
+  const r = await fetch(url(path), opt);
   if (!r.ok) {
     let msg = r.statusText;
     try { msg = (await r.json()).detail || msg; } catch (e) {}
@@ -142,7 +158,7 @@ async function showPage(no) {
 
   const wrap = el('div', 'page-rel');
   const img = el('img');
-  img.src = `/api/projects/${encodeURIComponent(S.project.name)}/pages/${no}.png?w=760&t=${Date.now()}`;
+  img.src = url(`/api/projects/${encodeURIComponent(S.project.name)}/pages/${no}.png?w=760&t=${Date.now()}`);
   img.onload = () => { host.innerHTML = ''; host.appendChild(wrap); drawBoxes(wrap, img); };
   img.onerror = () => { host.innerHTML = '<div class="empty">这一页渲染失败</div>'; };
   wrap.appendChild(img);

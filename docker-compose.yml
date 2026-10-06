@@ -21,6 +21,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       COMIC_PROJECTS: /data/projects
+      # 挂子路径时填（如 /comic/）；服务端会把它注入 <base href>
+      COMIC_BASE_PATH: ${COMIC_BASE_PATH:-/}
+      # 中文字体路径（镜像内已装 fonts-noto-cjk，一般不用改）
+      # COMIC_FONT: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
     volumes:
       # 项目数据持久化（IR 文件、素材、导出产物）
       - comic-projects:/data/projects

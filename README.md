@@ -18,6 +18,12 @@
 
 ## 效果演示
 
+### 🌐 在线 Demo
+
+**http://36.151.150.140/comic/**
+
+（京东云 4 核 16 GB，Nginx 子路径 `/comic/` + systemd，生图用 mock 避免额度被刷）
+
 ### 工作台：可视化编辑 Comic IR
 
 ![工作台](docs/images/workbench.png)
@@ -181,7 +187,28 @@ docker compose up -d
 ```
 
 镜像内置中文字体、预生成示例项目、带健康检查、数据持久化。
-详见 [`docs/deploy.md`](docs/deploy.md)（含 Nginx / HTTPS / 公网 Demo 成本控制）
+详见 [`docs/deploy.md`](docs/deploy.md)（含 Nginx / HTTPS / 子路径 / 公网成本控制）
+
+### 部署到已有服务的服务器（子路径模式）
+
+服务器 80 端口常被别的服务占用。本应用支持挂在子路径下：
+
+```bash
+# 服务端注入 <base href="/comic/">，前端相对路径与接口前缀自动算对
+python -m apps.api.server --port 8500 --base-path /comic/
+```
+
+```nginx
+location /comic/ {
+    proxy_pass http://127.0.0.1:8500/;   # 结尾的 / 负责剥掉 /comic 前缀
+}
+```
+
+一键部署（含字体安装、systemd、Nginx 追加配置、9 项远程验证）：
+
+```bash
+python scripts/deploy_remote.py
+```
 
 ### 真实素材演示
 
@@ -314,10 +341,23 @@ python scripts/e2e_check.py
 | `test_render.py` | 24 | 提示词三段 / Mock provider / 合成 / 导出 / 逐像素可复现 |
 | `test_api.py` | 30 | 全部接口 + 编辑落盘 + 路径穿越防护 + **无改页码接口** |
 | `test_frontend.py` | 8 | JS 语法（node --check）/ HTML 挂载点 / 前后端路由对齐 / README 图链 |
+| `test_subpath.py` | 8 | 子路径部署：`<base>` 注入 / 静态资源 / 接口前缀 / uvicorn 重导入坑 |
+| `test_fonts.py` | 12 | **中文字体检测**（防「静默变方块」）/ 两条探测分支 / 缓存 / 警告 |
+| `test_packaging.py` | 3 | **依赖声明与实际 import 一致** / extras 覆盖 / 包发现 |
 
-> `test_frontend.py` 是踩坑产物：曾经因为 `app.js` 少一个括号导致**整个工作台白板**，
-> 而所有 Python 测试仍然全绿（浏览器不会把 JS 错误报给服务端）。
-> 现在用 `node --check` 把它挡住，并实测验证过该测试确实能抓到这个 bug。
+### 三个「只有上服务器才会暴露」的坑
+
+这三个都是本地全绿、部署才炸，现在都有测试挡住：
+
+| 坑 | 现象 | 根因 |
+|---|---|---|
+| **缺 numpy** | 服务启动即崩 | `pyproject.toml` 漏声明（本地早装好） |
+| **缺中文字体** | 气泡中文全变方块，**接口仍返回 200** | 服务器只有 DejaVu，旧代码静默回落 `load_default()` |
+| **字体探测失效** | 装了字体仍被判「不含中文」 | `mask.tobytes()` 在 **Pillow 12.3 被移除**，异常被吞 |
+
+> 第二个最值得记：**静默降级比报错危险得多** —— 接口全绿、日志干净，
+> 只有肉眼看图才发现全是方块。现在找不到中文字体会发 `RuntimeWarning`，
+> 部署脚本也会单独验证这一项。
 
 ---
 

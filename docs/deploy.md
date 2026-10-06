@@ -1,5 +1,21 @@
 # 部署指南
 
+## 在线 Demo（已部署 ✅）
+
+**http://36.151.150.140/comic/**
+
+- 服务器：京东云 4 核 / 16 GB / 100 GB SSD，Ubuntu 24.04
+- 部署方式：venv + systemd（监听 `127.0.0.1:8500`）+ Nginx 子路径 `/comic/`
+- 生图服务：`mock`（零成本，避免公网被刷额度）
+- 一键重新部署：`python scripts/deploy_remote.py`
+
+> ⚠️ **这台服务器同时跑着另一个生产系统**（data-platform：Doris / Airflow /
+> MinIO / MySQL 等 11 个容器，占用 80 端口与 `/data/` `/airflow/` `/grafana/` 等子路径）。
+> 本应用**只追加**一个 `location /comic/`，不覆盖任何现有配置，
+> 且每次改动前都会备份 `data-platform.conf`。
+
+---
+
 三种部署方式，按需选择。
 
 ---
@@ -8,7 +24,7 @@
 
 ```bash
 git clone <repo> && cd ai-comic-studio
-pip install -e ".[dev]"
+pip install -e ".[dev,web]"
 
 # 生成示例项目
 python scripts/make_demo_project.py
@@ -20,6 +36,53 @@ python -m apps.api.server --port 8000
 ```
 
 **依赖**：Python 3.10+。无 Node、无前端构建。
+
+> **中文字体是硬需求**：缺字体时气泡里的中文会渲染成方块。
+> Linux 上先装：`apt-get install -y fonts-wqy-microhei`（约 4 MB）
+> 或 `fonts-noto-cjk`。也可用 `COMIC_FONT=/path/to/font.ttf` 显式指定。
+
+---
+
+## 生产实况：子路径部署（/comic/）
+
+服务器 80 端口是唯一对外入口且已被占用，所以本应用挂在子路径下。
+
+### 路径推导链（每一环都不能错）
+
+```
+① 浏览器  http://IP/comic/
+② 服务端返回 HTML，注入  <base href="/comic/">
+③ HTML 里写  "static/app.js"（相对路径）
+   → 浏览器按 base 解析成  /comic/static/app.js
+④ nginx   location /comic/ { proxy_pass http://127.0.0.1:8500/; }
+   —— proxy_pass 结尾的 / 负责**剥掉** /comic 前缀
+   → 应用收到  /static/app.js
+⑤ 应用  StaticFiles(directory="apps/workbench") 挂在 /static
+   → 命中文件  apps/workbench/app.js
+```
+
+**关键点**：`--base-path` 只影响注入的 `<base href>`，不影响应用内部路由。
+应用本身仍然跑在根路径，由 Nginx 负责剥前缀 —— 这样应用代码不需要知道部署路径。
+
+### 验证
+
+```bash
+python scripts/check_subpath.py     # 本地模拟子路径模式
+python scripts/deploy_remote.py --verify   # 远程验证 9 项
+```
+
+### 部署踩到的三个坑（都已修 + 已加测试）
+
+| 坑 | 现象 | 根因 | 现状 |
+|---|---|---|---|
+| **缺 numpy** | 服务启动即 `ModuleNotFoundError` | `pyproject.toml` 的 dependencies 漏了 numpy（`bubble.py` 用到）；本地早装好所以没暴露 | 已补；`tests/test_packaging.py` 静态检查「所有第三方 import 都已声明」 |
+| **缺中文字体** | 气泡中文全变**方块**，但接口返回 200、图片正常生成 | 服务器只有 DejaVu；旧 `load_font` 找不到中文字体就静默回落 `load_default()` | 装 `fonts-wqy-microhei`；`load_font` 改为**大声警告**；`tests/test_fonts.py` 12 项 |
+| **字体探测失效** | 装了字体仍被判为「不含中文」 | `_has_cjk` 用 `mask.tobytes()`，**Pillow 12.3 移除了该 API**，异常被吞 → 所有字体都判 False | 改为查 cmap（fontTools）；`fonttools` 升为必需依赖 |
+
+> 第二个坑最值得记：**静默降级**比报错危险得多 ——
+> 接口全绿、日志干净，只有肉眼看图才发现全是方块。
+> 现在 `render_page` 找不到中文字体会发 `RuntimeWarning`，
+> 部署脚本也会单独验证这一项。
 
 ---
 

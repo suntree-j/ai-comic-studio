@@ -21,6 +21,7 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WB = os.path.join(ROOT, "apps", "workbench")
+STATIC = os.path.join(WB, "static")
 
 NODE = shutil.which("node")
 
@@ -53,10 +54,31 @@ def test_app_js_is_not_empty():
 
 
 def test_html_references_existing_assets():
+    """静态资源引用必须用相对路径，并能在部署链路上解析到真实文件
+
+    ★ 完整路径推导（也是 docs/deploy.md 里的部署约定）：
+        ① 浏览器请求  http://IP/comic/
+        ② 服务端返回 HTML，注入 <base href="/comic/">
+        ③ HTML 里写 "static/app.js"（相对路径）
+           → 浏览器按 base 解析成  /comic/static/app.js
+        ④ nginx  `location /comic/ { proxy_pass http://127.0.0.1:8500/; }`
+           —— proxy_pass 结尾的 **/** 负责剥掉 /comic 前缀
+           → 应用收到  /static/app.js
+        ⑤ 应用  StaticFiles(directory="apps/workbench") 挂在 /static
+           → 命中文件  apps/workbench/app.js
+    """
     html = open(os.path.join(WB, "index.html"), encoding="utf-8").read()
-    for m in re.finditer(r'(?:src|href)="/static/([^"]+)"', html):
-        f = os.path.join(WB, m.group(1))
-        assert os.path.exists(f), f"index.html 引用了不存在的 {m.group(1)}"
+    refs = re.findall(r'(?:src|href)="(static/[^"]+)"', html)
+    assert refs, "index.html 没有引用任何静态资源"
+
+    for rel in refs:
+        # 应用侧收到 /static/xxx；StaticFiles 根是 apps/workbench
+        actual = os.path.join(WB, *rel.split("/")[1:])
+        assert os.path.exists(actual), \
+            f"引用了不存在的资源：{rel}（按部署映射应落在 {actual}）"
+
+    assert not re.search(r'(?:src|href)="/static/', html), \
+        "静态资源不应使用 /static 绝对路径（挂子路径时会 404），请用相对路径"
 
 
 def test_html_has_required_mount_points():

@@ -49,8 +49,118 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
     r"C:\Windows\Fonts\simhei.ttf",    # 黑体
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
     "/System/Library/Fonts/PingFang.ttc",
 ]
+
+#: 额外用 glob 兜底（各发行版路径不统一）
+FONT_GLOBS = [
+    "/usr/share/fonts/**/NotoSansCJK*.ttc",
+    "/usr/share/fonts/**/NotoSansSC*.otf",
+    "/usr/share/fonts/**/NotoSerifCJK*.ttc",
+    "/usr/share/fonts/**/wqy-*.ttc",
+    "/usr/share/fonts/**/wqy-*.ttf",
+    "/usr/share/fonts/**/*CJK*.ttc",
+    "/usr/share/fonts/**/SourceHanSans*.otf",
+    "/usr/share/fonts/**/DroidSansFallback*.ttf",
+]
+
+#: 用来判断字体是否真的含中文字形（缺字形会渲染成方块）
+_CJK_PROBE = "雪花穆宁冰"
+
+
+def _has_cjk(path: str) -> bool:
+    """检查字体文件是否包含中文字形
+
+    ★ 两轮踩坑记录（都在这一个函数上）：
+
+      第一轮：用 `font.getmask("雪").tobytes()` 判断，
+        Pillow 12.3 移除了 `ImagingCore.tobytes()`，异常被吞 →
+        **所有字体都被判为不含中文** → 线上一直用方块字体。
+        本机因装了 fontTools 走了另一分支，所以没暴露。
+
+      第二轮：改用 `font.getbbox(ch)` 判断，
+        实测发现**纯拉丁字体（arial/consola/tahoma）对缺失字形也返回非空 bbox**，
+        于是 arial 被判为「含中文」—— 依然错。
+        渲染墨迹比同样区分不开（雅黑 0.112 vs tahoma 0.062，量级相同）。
+
+      **结论：只有查 cmap 可靠 → 以 fontTools 为准。**
+      没有 fontTools 时返回 False（宁可误报「找不到」并发出警告，
+      也不要误报「找到了」然后默默输出方块）。
+    """
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError:
+        return False                    # 见上面第二轮说明：不猜
+
+    try:
+        f = TTFont(path, fontNumber=0, lazy=True)
+        cmap = f.getBestCmap()
+    except Exception:                                   # noqa: BLE001
+        return False
+    if not cmap:
+        return False
+    return all(ord(ch) in cmap for ch in _CJK_PROBE)
+
+
+def find_cjk_font() -> Optional[str]:
+    """找一个真的含中文字形的字体文件
+
+    优先环境变量 COMIC_FONT 指定的路径。
+    ★ 这个函数存在的理由：服务器上只有 DejaVu 时，
+      旧实现会静默回落到 load_default()，气泡里的中文全变方块，
+      而接口依然返回 200 —— 极难发现。
+    """
+    env = os.environ.get("COMIC_FONT")
+    if env and os.path.exists(env):
+        return env
+
+    seen = set()
+    for p in FONT_CANDIDATES:
+        seen.add(p)
+        if os.path.exists(p) and _has_cjk(p):
+            return p
+
+    import glob as _glob
+    for pattern in FONT_GLOBS:
+        for p in sorted(_glob.glob(pattern, recursive=True)):
+            if p in seen:
+                continue
+            seen.add(p)
+            if _has_cjk(p):
+                return p
+    return None
+
+
+_FONT_CACHE: Dict[Tuple[str, int], ImageFont.FreeTypeFont] = {}
+_font_warned = [False]
+
+
+def load_font(size: int) -> ImageFont.FreeTypeFont:
+    """加载中文字体；找不到时**大声报警**而不是静默变方块"""
+    path = find_cjk_font()
+    if path is None:
+        if not _font_warned[0]:
+            _font_warned[0] = True
+            import warnings
+            warnings.warn(
+                "找不到含中文字形的字体，气泡与标题里的中文会渲染成方块。\n"
+                "  修复：Linux 执行 `apt-get install -y fonts-noto-cjk`"
+                "（或 fonts-wqy-microhei），\n"
+                "        或用环境变量 COMIC_FONT=/path/to/font.ttf 指定。",
+                RuntimeWarning, stacklevel=2)
+        return ImageFont.load_default()
+
+    key = (path, size)
+    if key not in _FONT_CACHE:
+        try:
+            _FONT_CACHE[key] = ImageFont.truetype(path, size)
+        except Exception:                               # noqa: BLE001
+            return ImageFont.load_default()
+    return _FONT_CACHE[key]
 
 # 技能属性 → 颜色
 ELEMENT_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -65,16 +175,6 @@ ELEMENT_COLORS: Dict[str, Tuple[int, int, int]] = {
     "冰鸾": (150, 205, 240),
     "冰凤": (180, 215, 235),
 }
-
-
-def load_font(size: int) -> ImageFont.FreeTypeFont:
-    for p in FONT_CANDIDATES:
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:                               # noqa: BLE001
-                continue
-    return ImageFont.load_default()                         # pragma: no cover
 
 
 # ══════════════════════════════════════════════════════════════════

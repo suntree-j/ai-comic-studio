@@ -23,17 +23,30 @@ dependencies = [
     "pydantic>=2.6",
     "httpx>=0.27",
     "Pillow>=10.0",
+    "numpy>=1.24",
+    # 用 cmap 精确判断字体是否含中文字形。
+    # 没有它时无法可靠区分「中文字体」与「拉丁字体」——
+    # 曾因此让线上气泡中文全变方块（见 packages/render/page.py::_has_cjk）
+    "fonttools>=4.40",
 ]
 
 [project.optional-dependencies]
 pdf = ["pymupdf>=1.24"]
+# 工作台后端（apps/api）
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "python-multipart>=0.0.9",
+]
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]
 comic = "packages.cli:main"
 
-[tool.setuptools]
-packages = ["packages", "packages.ir", "packages.agent"]
+# ★ 用自动发现而不是手写列表 —— 手写列表曾经漏掉 packages.render，
+#   导致安装后 import 失败（本地因为直接跑源码目录所以没暴露）
+[tool.setuptools.packages.find]
+include = ["packages*", "apps*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
