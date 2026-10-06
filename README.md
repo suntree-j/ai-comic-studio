@@ -288,8 +288,9 @@ ai-comic-studio/
 ├── docs/
 │   ├── design.md            完整方案与架构
 │   ├── lessons.md           ★ 实战踩坑复盘（五个结构性坑）
+│   ├── modifying.md         ★ 改动指南（常见改动怎么做 / 红线 / 验证流程）
 │   ├── workbench.md         工作台说明
-│   ├── deploy.md            部署指南（本地 / Docker / Nginx）
+│   ├── deploy.md            部署指南（本地 / Docker / Nginx / 子路径）
 │   ├── roadmap.md           路线图
 │   └── images/              演示截图
 ├── scripts/
@@ -384,10 +385,13 @@ python scripts/e2e_check.py
 - [x] **Phase 2 · Agent 层** —— Provider 抽象 + 提示词 + 5 技能 + 自修复
 - [x] **Phase 3 · 渲染层** —— 生图适配 + 提示词组装 + 气泡算法 + PDF
 - [x] **Phase 4 · 工作台** —— FastAPI + 可视化编辑
-- [x] **Phase 5 · 部署** —— Docker + 示例项目
-- [ ] 更多：多语言 / 条漫模式 / 协作 / 版本 diff
+- [x] **Phase 5 · 部署** —— Docker + 线上 Demo（http://36.151.150.140/comic/）
+- [ ] 更多：真实生图案例 / 在线试玩 / 条漫模式 / 版本 diff
 
 详见 [`docs/roadmap.md`](docs/roadmap.md)
+
+**想改这个项目？** 先看 [`docs/modifying.md`](docs/modifying.md) ——
+常见改动怎么做、五条不能破的红线、改完如何验证与部署。
 
 ---
 

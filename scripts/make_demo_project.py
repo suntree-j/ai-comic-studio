@@ -309,20 +309,26 @@ def build_source(proj_dir):
 open(os.path.join(PROJ, "source.txt"), "w", encoding="utf-8").write(
     build_source(PROJ))
 
-# 用 Mock 生图产出素材，工作台打开即可见
-studio = RenderStudio(MockImageProvider())
-rep = studio.generate_panels(
-    bible, [p for sb in storyboards for p in sb.panels],
-    os.path.join(PROJ, "assets"))
 
-print()
-print("  ✅ 示例项目已生成：projects/demo/")
-print(f"     角色 {len(bible.characters)} ｜ 场景 {len(bible.scenes)} ｜ "
-      f"技能 {len(bible.skills)}")
-print(f"     章节 {len(storyboards)} ｜ 镜头 {sum(len(s.panels) for s in storyboards)} ｜ "
-      f"对白 {sum(len(v) for v in dialogue.items.values())} ｜ 页数 {layout.total}")
-print(f"     素材 {rep.generated} 张（Mock）")
-print()
-print("  启动工作台：")
-print("     python -m apps.api.server --port 8000")
-print("     然后打开 http://127.0.0.1:8000")
+def _make_assets():
+    """用 Mock 生图产出素材，工作台打开即可见"""
+    studio = RenderStudio(MockImageProvider())
+    return studio.generate_panels(
+        bible, [p for sb in storyboards for p in sb.panels],
+        os.path.join(PROJ, "assets"))
+
+
+if __name__ == "__main__":
+    rep = _make_assets()
+    print()
+    print("  ✅ 示例项目已生成：projects/demo/")
+    print(f"     角色 {len(bible.characters)} ｜ 场景 {len(bible.scenes)} ｜ "
+          f"技能 {len(bible.skills)}")
+    print(f"     章节 {len(storyboards)} ｜ "
+          f"镜头 {sum(len(s.panels) for s in storyboards)} ｜ "
+          f"对白 {sum(len(v) for v in dialogue.items.values())} ｜ 页数 {layout.total}")
+    print(f"     素材 {rep.generated} 张（Mock）")
+    print()
+    print("  启动工作台：")
+    print("     python -m apps.api.server --port 8000")
+    print("     然后打开 http://127.0.0.1:8000")
