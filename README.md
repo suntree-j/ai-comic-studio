@@ -296,6 +296,9 @@ ai-comic-studio/
 │   └── images/              演示截图
 ├── scripts/
 │   ├── e2e_check.py              ★ 端到端验收（25 项，一条命令）
+│   ├── verify_online.py          ★ 线上自检（GitHub 仓库 + 服务器，28 项）
+│   ├── deploy_remote.py          一键部署到服务器
+│   ├── check_subpath.py          验证子路径部署模式
 │   ├── make_demo_project.py      一键生成示例项目
 │   ├── make_showcase_project.py  用真实素材生成展示项目
 │   ├── make_graphics.py          生成 README 演示对比图
@@ -332,9 +335,20 @@ python scripts/e2e_check.py
 25/25 项通过
 ```
 
-### 测试覆盖
+### 线上状态自检
 
-| 测试文件 | 数量 | 覆盖 |
+```bash
+python scripts/verify_online.py
+```
+
+```
+① GitHub 仓库   公开 · 默认分支 main · 67 文件 · 提交已关联账号 · README 图 3/3 可访问
+② 部署的服务器   11 个接口 200 · 页面图 33 KB · IR 校验通过
+
+28/28 项通过
+```
+
+### 测试覆盖| 测试文件 | 数量 | 覆盖 |
 |---|---|---|
 | `test_validator.py` | 26 | 12 条规则各自的反例 + 正确样例必须通过 |
 | `test_agent.py` | 20 | JSON 提取 / 自修复编排 / 错误回喂验证 / 状态追踪 |
