@@ -1,0 +1,144 @@
+# -*- coding: utf-8 -*-
+"""生成一个最小可运行的示例项目（examples/minimal/）
+
+    examples/minimal/
+    ├── bible.json        角色/场景/技能/风格
+    ├── source.txt        示例原文
+    └── run_mock.py       用 MockProvider 离线跑通全流程（不需要 API key）
+"""
+import io, json, os, sys
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+OUT = os.path.join(ROOT, 'examples', 'minimal')
+os.makedirs(OUT, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════
+# 示例原文
+# ══════════════════════════════════════════════════════════════════
+SOURCE = """第2436章 冰晶刹弓
+
+雪落在冰玻璃长道上，铺成一层薄薄的白。
+穆宁雪站在长道的一端，银白色的长发被风掀起。她右手抬起，冰晶刹弓在掌心凝聚成形。
+
+「你喜欢这柄冰晶刹弓，作为多年的朋友，我自然亲手赠你。」
+
+话音落下，箭矢离弦。
+长道另一端的南荣倪来不及闪避，被一箭钉在了断崖上，动弹不得。
+
+穆飞鸾与穆隐凤并肩从长道另一端走来。穆飞鸾的眼中满是倨傲。
+「解决掉他们。」穆飞鸾说。
+"""
+
+# ══════════════════════════════════════════════════════════════════
+# bible
+# ══════════════════════════════════════════════════════════════════
+BIBLE = {
+    "characters": {
+        "mu_ningxue": {
+            "id": "mu_ningxue",
+            "name": "穆宁雪",
+            "aliases": ["宁雪", "雪雪"],
+            "appearance": {
+                "text": (
+                    "一位二十出头的年轻女子。冷调雪银白色的长发（明度高、接近雪白，"
+                    "带极淡冷灰调；绝对不要淡紫色、不要银灰发黄）；额前有整齐的刘海"
+                    "（覆盖额头、长度齐眉、发丝分明）；其余长发盘成端庄的低髻（在脑后偏下），"
+                    "两侧各留一缕长垂发垂至腰际。长脸形，下巴尖而收；眼睛大而长、微微上挑；"
+                    "淡冰蓝色瞳孔（正常单一眸色、虹膜干净，绝对不要任何星形／雪花纹样）；"
+                    "神情冷淡平静、下巴微抬。服装：纯白色的立领修身外套——立领、收腰、"
+                    "双排暗扣，下摆及膝并略向外扩、正面开衩；内层白色立领紧身上衣，"
+                    "下配白色短裙；颈间一条正红色的长围巾，绕颈一圈后尾端长长地向后飘扬；"
+                    "双手戴及肘的黑色长手套；脚穿浅灰白色的短靴。"
+                    "身形约七头身；肩线清晰、骨架写实；绝不拉长腿部、不细腰、不纸片人。"
+                    "★ 全篇只有这一套：绝对不要蓝色系服装、不要针织开衫、不要露出额头。"
+                ),
+                "forbidden": ["蓝色系服装", "针织开衫", "露出额头", "星形瞳孔纹样"]
+            },
+            "variants": {
+                "battle": {
+                    "name": "战斗形态",
+                    "override": "衣袍与长发被气场掀起，可加冰系能量丝与冰翼；服装同上。",
+                    "preserve_face": True,
+                    "preserve_eye_color": True
+                }
+            },
+            "ref_images": [],
+            "state": {"outfit": "default", "injuries": [], "emotion": "冷冽"}
+        },
+        "mu_feiluan": {
+            "id": "mu_feiluan",
+            "name": "穆飞鸾",
+            "aliases": [],
+            "appearance": {
+                "text": (
+                    "一位二十多岁的年轻男子。银白色长发（被气场掀起）；面容英挺、剑眉、"
+                    "狭长眼型、高鼻梁；浅色瞳孔（单一眸色、无纹样）。"
+                    "服装：浅蓝色的长毛领大衣（毛领厚实蓬松）＋内搭黑色高领＋黑色长靴。"
+                    "★ 全篇只有这一套：不要换成长袍、不要换色。"
+                ),
+                "forbidden": ["换色", "长袍"]
+            },
+            "variants": {
+                "ice_wing": {
+                    "name": "冰鸾甲翼",
+                    "override": (
+                        "背后浮现冰鸾甲翼——不是羽毛，而是由暗蓝冰铁锻造的厚甲翼片，"
+                        "翼骨如支架、翼面由层层铆合的冰板拼成，精密机械感、坚厚雄壮。"
+                    ),
+                    "preserve_face": True,
+                    "preserve_eye_color": True
+                }
+            },
+            "ref_images": [],
+            "state": {"outfit": "default", "injuries": [], "emotion": "倨傲"}
+        }
+    },
+    "scenes": {
+        "ice_corridor": {
+            "id": "ice_corridor",
+            "name": "冰玻璃长道",
+            "text": "雪竹林间的冰玻璃长道，路面如冰面倒映天光，尽头是穆氏城楼。",
+            "ref_images": []
+        }
+    },
+    "skills": {
+        "ice_bow": {
+            "id": "ice_bow",
+            "name": "冰晶刹弓",
+            "element": "绝冰",
+            "color": [165, 228, 252],
+            "ref_images": []
+        }
+    },
+    "style": {
+        "shared_block": (
+            "全彩国漫风格的商业漫画页，柔和通透的画面。\n"
+            "【线条】线条很细，颜色为深蓝紫或深褐（不是纯黑），对比柔和；"
+            "外轮廓只比内部线略粗一点；线条干净少交叉。\n"
+            "【上色】柔和渐变上色（喷枪式过渡），每块颜色2到3层柔和过渡、阴影边缘不硬；"
+            "空气感与柔光；对比偏低、偏亮通透；中等偏高的清亮饱和度。\n"
+            "【环境光】冷色调环境光渗进皮肤、衣料与空气。\n"
+            "【比例】约七头身；肩线清晰、骨架写实；不拉长腿、不细腰、不纸片人；"
+            "脸型偏长、下巴尖而收。\n"
+            "【眼睛】眼睛大而长；上睫毛粗黑明显、下睫毛也画出；虹膜上部大片白色高光。\n"
+            "【战斗形态】战斗中人物处于战斗形态（翼展开／元素凝聚／能量线缠绕／"
+            "衣袍头发被气场掀起）。"
+        ),
+        "no_text_rule": (
+            "画面中绝对不要出现任何文字、台词、对白框、气泡、字幕、水印、logo、"
+            "任何中文/英文/日文字符。"
+        )
+    }
+}
+
+with open(os.path.join(OUT, 'bible.json'), 'w', encoding='utf-8') as f:
+    json.dump(BIBLE, f, ensure_ascii=False, indent=1)
+with open(os.path.join(OUT, 'source.txt'), 'w', encoding='utf-8') as f:
+    f.write(SOURCE)
+print('  ✅ 已生成 %s' % OUT)
+print('     bible.json  (角色 %d / 场景 %d / 技能 %d)'
+      % (len(BIBLE['characters']), len(BIBLE['scenes']), len(BIBLE['skills'])))
+print('     source.txt  (%d 字 / %d 行)' % (len(SOURCE), len(SOURCE.splitlines())))

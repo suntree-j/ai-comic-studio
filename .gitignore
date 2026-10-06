@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 项目产物（体积大，不入库）
+out/
+output/
+*.pdf
+!docs/**/*.pdf
+*.png
+*.jpg
+!docs/**/*.png
+!docs/**/*.jpg
+examples/**/finals/
+examples/**/panels/
+examples/**/assets/
+
+# 密钥
+.env
+.env.*
+*.key
+secrets.json
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
