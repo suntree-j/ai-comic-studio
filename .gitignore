@@ -23,7 +23,9 @@ projects/
 *.png
 *.jpg
 !docs/**/*.png
+!docs/images/*.png
 !docs/**/*.jpg
+!docs/images/*.jpg
 examples/**/finals/
 examples/**/panels/
 examples/**/assets/

@@ -16,6 +16,24 @@
 
 ---
 
+## 效果演示
+
+### 工作台：可视化编辑 Comic IR
+
+![工作台](docs/images/workbench.png)
+
+左侧项目概览与**只读页码**（冻结机制），中间画布叠加**可拖拽的气泡框**，
+右侧对白编辑（说话人下拉 + 确认徽章 + 锁定开关）。
+
+### 核心价值：改一句话，画面不变
+
+![编辑演示](docs/images/edit_demo.png)
+
+对白只存在 JSON 里，改完**只重渲染那一页**（约 3 秒），
+底图完全不动 —— 不需要重新出图。
+
+---
+
 ## 问题：直接让 AI 画漫画，有三个必死问题
 
 | 问题 | 现象 |
@@ -151,8 +169,21 @@ python -m apps.api.server --port 8000
 ### Docker 一键部署
 
 ```bash
+cp .env.example .env         # 按需填 key
 docker compose up -d
 # http://localhost:8000
+```
+
+镜像内置中文字体、预生成示例项目、带健康检查、数据持久化。
+详见 [`docs/deploy.md`](docs/deploy.md)（含 Nginx / HTTPS / 公网 Demo 成本控制）
+
+### 真实素材演示
+
+```bash
+# 用一份已有漫画 PDF 的画面当素材，演示效果更真实
+python scripts/make_showcase_project.py --from-pdf path/to/comic.pdf
+python -m apps.api.server --port 8000
+# http://127.0.0.1:8000/?project=showcase&page=2
 ```
 
 ---
@@ -225,8 +256,15 @@ ai-comic-studio/
 │   ├── design.md            完整方案与架构
 │   ├── lessons.md           ★ 实战踩坑复盘（五个结构性坑）
 │   ├── workbench.md         工作台说明
-│   └── roadmap.md           路线图
-├── scripts/                 示例项目 / 冒烟测试
+│   ├── deploy.md            部署指南（本地 / Docker / Nginx）
+│   ├── roadmap.md           路线图
+│   └── images/              演示截图
+├── scripts/
+│   ├── make_demo_project.py      一键生成示例项目
+│   ├── make_showcase_project.py  用真实素材生成展示项目
+│   ├── make_graphics.py          生成 README 演示图
+│   ├── shoot.py                  headless 截图
+│   └── smoke_api.py              API 冒烟测试
 ├── Dockerfile
 └── docker-compose.yml
 ```

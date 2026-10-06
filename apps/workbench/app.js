@@ -127,6 +127,12 @@ function currentPage() {
 async function showPage(no) {
   S.page = no;
   S.sel = null;
+  // 同步到 URL，便于分享与回退
+  const u = new URL(location.href);
+  u.searchParams.set('project', S.project.name);
+  u.searchParams.set('page', String(no));
+  history.replaceState(null, '', u);
+
   const lp = currentPage();
   $('#pageLabel').textContent = `第 ${no} / ${S.project.layout.total} 页`
     + (lp && lp.type === 'title' ? '（标题页）' : '');
@@ -450,4 +456,30 @@ $('#btnExport').onclick = async () => {
 };
 
 /* ── 启动 ───────────────────────────────────────────── */
-loadProjects().catch(e => toast('加载失败：' + e.message));
+
+/** 支持 URL 定位：?project=demo&page=2 （方便分享链接与截图） */
+function bootParams() {
+  const q = new URLSearchParams(location.search);
+  return { project: q.get('project'), page: parseInt(q.get('page') || '0', 10) };
+}
+
+(async function boot() {
+  try {
+    const list = await api('/api/projects');
+    const want = bootParams();
+    if (!list.length) return loadProjects();
+    const pick = (want.project && list.some(p => p.name === want.project))
+      ? want.project : list[0].name;
+    $('#projectSel').innerHTML = '';
+    list.forEach(p => {
+      const o = el('option', '', `${p.name}　${p.pages}页`);
+      o.value = p.name;
+      if (p.name === pick) o.selected = true;
+      $('#projectSel').appendChild(o);
+    });
+    await openProject(pick);
+    if (want.page && want.page >= 1 && want.page <= S.project.layout.total) {
+      await showPage(want.page);
+    }
+  } catch (e) { toast('加载失败：' + e.message); }
+})();
