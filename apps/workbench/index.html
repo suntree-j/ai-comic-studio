@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Comic Studio · 漫画工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <b>AI Comic Studio</b>
+    <span class="tag">漫画工作台</span>
+  </div>
+  <div class="tools">
+    <select id="projectSel" title="选择项目"></select>
+    <button id="btnValidate" class="ghost">校验 IR</button>
+    <button id="btnRender" class="ghost">出图</button>
+    <button id="btnExport" class="primary">导出 PDF</button>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左：概览 -->
+  <aside class="panel left">
+    <h3>项目概览</h3>
+    <div id="stats" class="stats"></div>
+
+    <h3>角色</h3>
+    <div id="charList" class="chips"></div>
+
+    <h3>页码（冻结）</h3>
+    <div class="hint">页码一经分配不再重排；删除只留空位。</div>
+    <div id="pageList" class="pages"></div>
+  </aside>
+
+  <!-- 中：画布 -->
+  <section class="canvas-wrap">
+    <div class="canvas-bar">
+      <button id="prevPage">‹ 上一页</button>
+      <span id="pageLabel">—</span>
+      <button id="nextPage">下一页 ›</button>
+      <label class="switch">
+        <input type="checkbox" id="showBoxes" checked> 显示气泡框
+      </label>
+      <span id="reloadHint" class="hint"></span>
+    </div>
+    <div id="canvasHost" class="canvas-host">
+      <div class="empty">请选择一个项目</div>
+    </div>
+  </section>
+
+  <!-- 右：对白编辑 -->
+  <aside class="panel right">
+    <h3>本页对白</h3>
+    <div id="uttList" class="utts"></div>
+    <h3>本页镜头</h3>
+    <div id="panelList" class="panels"></div>
+  </aside>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

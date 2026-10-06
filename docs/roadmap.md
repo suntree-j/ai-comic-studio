@@ -100,24 +100,59 @@ python examples/minimal/run_full.py
 
 ---
 
-## Phase 4 · 工作台（展示门面）  下一步
+## Phase 4 · 工作台  ✅ 已完成
 
-- [ ] `apps/workbench/` — React + TS + Vite + Konva
-  - 分镜条（缩略图 + 拖拽排序）
-  - 页面画布（气泡拖拽 + 箭头尾端拖动 + 锁定）
-  - 对白编辑（说话人下拉）
-  - 一键重渲染当前页
-  - IR 版本历史 / diff
-- [ ] `apps/api/` — FastAPI 后端
-  - 项目 CRUD
-  - 渲染任务
-  - WebSocket 推送进度
-- [ ] 关键交互（来自实战教训）
-  - 气泡**可拖拽 + 可锁定**（自动放置必然出错）
-  - 说话人**必须人指定**（不能让程序猜）
-  - 页码**只读**（冻结机制）
+- [x] `apps/api/server.py` — FastAPI 后端（一个进程同时供 API + 静态前端）
+      - 项目 CRUD、IR 读取、12 条规则校验
+      - **页面渲染 API**（带内存缓存，改 IR 自动失效）
+      - **提示词透明化 API**（`/prompt/{panel_id}` 可看该格最终提示词）
+      - 对白 PATCH（说话人/文字/位置/箭头/锁定）
+      - 分镜 PATCH（距离/动作/氛围/损伤）
+      - 后台出图任务（线程 + 进度轮询，额度超限单独标记）
+      - 导出 PDF / 长图 + 下载
+      - ★ **没有改页码的接口** —— 冻结机制在接口层面锁死
+- [x] `apps/workbench/` — 三栏工作台（纯静态，零构建）
+      - 左：项目概览 / 角色 / 页码（只读）
+      - 中：画布（页面渲染图 + **可拖拽气泡框 + 可拖拽箭头尾端**）
+      - 右：对白编辑（说话人下拉 + 确认徽章 + 锁定开关）/ 本页镜头
+      - 顶栏：校验 IR（弹层展示规则命中）/ 出图（进度轮询）/ 导出 PDF
+- [x] `scripts/make_demo_project.py` — 一键生成示例项目（含 Mock 素材）
+- [x] `scripts/smoke_api.py` — API 端到端冒烟测试（含编辑闭环）
+- [x] `docs/workbench.md` — 工作台文档
 
-**验收**：不改代码就能完成「改气泡 → 重渲染 → 导出」
+**验收**（已实测）：
+```bash
+python scripts/make_demo_project.py     # 4 角色 / 3 章 / 8 格 / 9 页
+python -m apps.api.server --port 8000
+```
+```
+OK  首页 / app.js / style.css
+OK  第2页渲染图 200 image/jpeg 33.1 KB
+OK  第7页渲染图 200 image/jpeg 68.6 KB
+OK  单格底图    200 image/jpeg 15.5 KB
+OK  规则表      12 条
+── 编辑闭环 ──
+PATCH box → 200 {'x': 0.62, 'y': 0.05}
+重渲染后图片变化：是
+PATCH who → 200 who=mo_fan confirmed=False（应为 False）✅
+── 导出 ──
+导出 PDF 200 / 下载 537.3 KB ✅
+── 示例项目校验 ──
+ok=True 校验通过 ✅
+```
+
+---
+
+## Phase 5 · 打包展示  下一步
+
+- [ ] `Dockerfile` + `docker-compose.yml`（一键起）
+- [ ] 在线 Demo 站
+      - 预置案例可浏览（静态）
+      - 在线试玩：贴一段小说 → 看 AI 生成分镜（只跑 Agent，不跑出图）
+- [ ] `README.md` 演示 GIF / 截图
+- [ ] `docs/lessons.md` — 实战踩坑复盘
+
+**验收**：给一个 URL，陌生人 3 分钟看懂价值
 
 ---
 
