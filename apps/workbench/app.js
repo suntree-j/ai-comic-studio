@@ -407,15 +407,32 @@ $('#showBoxes').onchange = (e) => {
 
 $('#btnValidate').onclick = async () => {
   if (!S.project) return;
+  await showValidation();
+};
+
+/** 拉取校验结果并弹层展示（也可由 ?validate=1 自动触发） */
+async function showValidation() {
   const r = await api(`/api/projects/${encodeURIComponent(S.project.name)}/validate`,
     { method: 'POST' });
+  const errs = r.errors.filter(e => e.severity === 'error');
+  const warns = r.errors.filter(e => e.severity === 'warning');
+
+  let title;
+  if (!r.errors.length) title = '✅ 校验通过 · 0 问题';
+  else if (!errs.length) title = `⚠️ 校验通过（${warns.length} 个警告）`;
+  else title = `❌ 未通过 · ${errs.length} 个错误 / ${warns.length} 个警告`;
+
   const m = el('div', 'modal on');
   const inner = el('div', 'inner');
-  inner.appendChild(el('h2', '', r.ok ? '✅ 校验通过' : '⚠️ 发现 ' + r.errors.length + ' 个问题'));
-  inner.appendChild(el('p', 'hint', r.summary));
+  inner.appendChild(el('h2', '', title));
+  inner.appendChild(el('p', 'hint',
+    '错误会阻止渲染；警告不阻止但建议修。每条都附修正建议 —— '
+    + '这段文本就是回喂给 LLM 做自修复的内容。'));
   r.errors.forEach(e => {
     const row = el('div', 'err-row' + (e.severity === 'warning' ? ' warn' : ''));
-    row.innerHTML = `<span class="r">${e.rule}</span> ${e.where}<br>${e.message}`
+    row.innerHTML = `<span class="r">${e.rule}</span> `
+      + `<span class="badge ${e.severity === 'warning' ? 'warn' : ''}">`
+      + `${e.severity === 'warning' ? '警告' : '错误'}</span> ${e.where}<br>${e.message}`
       + (e.hint ? `<div class="h">修正：${e.hint}</div>` : '');
     inner.appendChild(row);
   });
@@ -426,7 +443,7 @@ $('#btnValidate').onclick = async () => {
   m.onclick = (e) => { if (e.target === m) m.remove(); };
   m.appendChild(inner);
   document.body.appendChild(m);
-};
+}
 
 $('#btnRender').onclick = async () => {
   if (!S.project) return;
@@ -466,6 +483,9 @@ function bootParams() {
 (async function boot() {
   try {
     const list = await api('/api/projects');
+    // #region debug
+    document.documentElement.setAttribute('data-boot', 'projects:' + list.length);
+    // #endregion
     const want = bootParams();
     if (!list.length) return loadProjects();
     const pick = (want.project && list.some(p => p.name === want.project))
@@ -478,8 +498,22 @@ function bootParams() {
       $('#projectSel').appendChild(o);
     });
     await openProject(pick);
+    document.documentElement.setAttribute('data-boot', 'ok:' + pick);
     if (want.page && want.page >= 1 && want.page <= S.project.layout.total) {
       await showPage(want.page);
     }
-  } catch (e) { toast('加载失败：' + e.message); }
+    if (new URLSearchParams(location.search).get('validate')) {
+      await showValidation();
+    }
+    document.documentElement.setAttribute('data-boot', 'ready');
+  } catch (e) {
+    document.documentElement.setAttribute('data-boot', 'error');
+    const box = document.createElement('pre');
+    box.style.cssText = 'position:fixed;inset:auto 16px 16px 16px;background:#3a1a1a;'
+      + 'color:#ffb4b4;padding:14px;border-radius:8px;z-index:999;white-space:pre-wrap';
+    box.textContent = '启动失败：' + (e && e.message ? e.message : e)
+      + '\n' + (e && e.stack ? e.stack : '');
+    document.body.appendChild(box);
+    toast('启动失败：' + (e && e.message ? e.message : e));
+  }
 })();
