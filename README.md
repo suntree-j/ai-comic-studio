@@ -8,7 +8,7 @@
 —— 用 **12 条业务规则 + 自修复循环** 解决 AI 生成漫画的
 **一致性 / 可编辑性 / 可复现性** 三大难题
 
-[![tests](https://img.shields.io/badge/tests-166%20passed-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-181%20passed-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
 [![demo](https://img.shields.io/badge/🌐_在线_Demo-36.151.150.140%2Fcomic-4a9eff)](http://36.151.150.140/comic/)
@@ -305,6 +305,7 @@ ai-comic-studio/
 ├── docs/
 │   ├── design.md            完整方案与架构
 │   ├── lessons.md           ★ 实战踩坑复盘（五个结构性坑）
+│   ├── demo-script.md       ★ 演示手册（怎么展示 / 工作台设计 / 会被问什么）
 │   ├── modifying.md         ★ 改动指南（常见改动怎么做 / 红线 / 验证流程）
 │   ├── workbench.md         工作台说明
 │   ├── deploy.md            部署指南（本地 / Docker / Nginx / 子路径）
@@ -367,18 +368,19 @@ python scripts/verify_online.py
 
 ### 测试覆盖| 测试文件 | 数量 | 覆盖 |
 |---|---|---|
-| `test_validator.py` | 26 | 12 条规则各自的反例 + 正确样例必须通过 |
 | `test_api.py` | 30 | 全部接口 + 编辑落盘 + 路径穿越防护 + **无改页码接口** |
+| `test_validator.py` | 26 | 12 条规则各自的反例 + 正确样例必须通过 |
 | `test_render.py` | 23 | 提示词三段 / Mock provider / 合成 / 导出 / 逐像素可复现 |
 | `test_agent.py` | 20 | JSON 提取 / 自修复编排 / 错误回喂验证 / 状态追踪 |
 | `test_bubble.py` | 17 | 人物检测 / 避让 / 分侧 / 竖排不重叠 / 确定性 |
+| `test_demo_script.py` | 15 | **演示手册里的每个交互都能在代码里找到** + 接口清单 + 数字准确 |
 | `test_fonts.py` | 13 | **中文字体检测**（防「静默变方块」）/ 两条探测分支 / 缓存 / 警告 |
 | `test_docs.py` | 12 | 文档示例代码的符号与真实代码一致 / 内部链接 / 红线完整性 |
 | `test_subpath.py` | 9 | 子路径部署：`<base>` 注入 / 静态资源 / 接口前缀 / uvicorn 重导入坑 |
 | `test_frontend.py` | 8 | JS 语法（node --check）/ HTML 挂载点 / 前后端路由对齐 / README 图链 |
 | `test_pipeline.py` | 5 | 端到端编排 / 页码冻结 / pending 降级 |
 | `test_packaging.py` | 3 | **依赖声明与实际 import 一致** / extras 覆盖 / 包发现 |
-| | **166** | |
+| | **181** | |
 
 ### 三个「只有上服务器才会暴露」的坑
 
@@ -426,6 +428,9 @@ python scripts/verify_online.py
 
 **想改这个项目？** 先看 [`docs/modifying.md`](docs/modifying.md) ——
 常见改动怎么做、五条不能破的红线、改完如何验证与部署。
+
+**要给别人演示这个项目？** 看 [`docs/demo-script.md`](docs/demo-script.md) ——
+8 分钟演示脚本、工作台的五个核心设计决策、可能被问的问题与回答要点。
 
 ---
 
