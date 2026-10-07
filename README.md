@@ -25,6 +25,13 @@
 
 （京东云 4 核 16 GB，Nginx 子路径 `/comic/` + systemd，生图用 mock 避免额度被刷）
 
+> **Demo 里的画面来自哪里？**
+> 取自已完成的《全职法师》漫画成品（168 页）。
+> 全书只有 **26 页画面没有烧进成品对白**，脚本会自动挑出这些页
+> （`scripts/make_showcase_project.py`：比例匹配 + 文字密度检测 + 擦除残留小字），
+> 这样叠加本系统自己的气泡才不会「文字叠文字」。
+> 另有 `demo` 项目用 Mock 占位图，用于离线验证渲染管线。
+
 ### 工作台：可视化编辑 Comic IR
 
 ![工作台](docs/images/workbench.png)
@@ -213,11 +220,20 @@ python scripts/deploy_remote.py
 
 ### 真实素材演示
 
+项目带一个用**真实漫画画面**当素材的展示项目：
+
 ```bash
-# 用一份已有漫画 PDF 的画面当素材，演示效果更真实
 python scripts/make_showcase_project.py --from-pdf path/to/comic.pdf
 python -m apps.api.server --port 8000
 # http://127.0.0.1:8000/?project=showcase&page=2
+```
+
+选页逻辑（成品页已含对白，必须避开）：
+
+```bash
+python scripts/clean_panels.py projects/showcase/assets/panels/*.png
+#   ch2436_P001.png  气泡 1 个  占面积 0.13%  极少文字
+#   ch2436_P002.png  气泡 0 个  占面积 0.00%  干净
 ```
 
 ---
@@ -299,8 +315,9 @@ ai-comic-studio/
 │   ├── verify_online.py          ★ 线上自检（GitHub 仓库 + 服务器，28 项）
 │   ├── deploy_remote.py          一键部署到服务器
 │   ├── check_subpath.py          验证子路径部署模式
-│   ├── make_demo_project.py      一键生成示例项目
-│   ├── make_showcase_project.py  用真实素材生成展示项目
+│   ├── make_demo_project.py      一键生成示例项目（Mock 素材）
+│   ├── make_showcase_project.py  从成品 PDF 抽真实素材（自动避开已含对白的页）
+│   ├── clean_panels.py           检测并擦除页面上烧入的文字
 │   ├── make_graphics.py          生成 README 演示对比图
 │   ├── shoot_ui.py               headless 截图（按文件大小确认加载完成）
 │   └── smoke_api.py              API 冒烟测试
