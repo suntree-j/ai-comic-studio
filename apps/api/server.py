@@ -65,6 +65,22 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
+#: 画布编辑器（Office 式，手工从空白页做漫画）
+#: 与上面的漫画 IR 接口正交、互不依赖
+from .editor import router as _editor_router                     # noqa: E402
+app.include_router(_editor_router)
+
+
+def _editor_route_paths() -> set:
+    """取出编辑器路由的路径
+
+    ★ FastAPI 0.142 的 `include_router` 是**延迟展开**的（注册成 _IncludedRouter），
+      直接遍历 `app.routes` 看不到子路由。这里显式取一次，
+      供测试与自检脚本核对「前端调的接口后端是否真的存在」。
+    """
+    import apps.api.editor as _ed
+    return {getattr(r, "path", "") for r in _ed.router.routes}
+
 
 # ══════════════════════════════════════════════════════════════════
 # 项目存取
@@ -504,15 +520,25 @@ def download(name: str, rest: str):
 # 静态前端
 # ══════════════════════════════════════════════════════════════════
 
+def _serve_workbench(fname: str) -> Response:
+    """把 BASE_PATH 注入 <base>，让前端在任何子路径下都能正确加载资源"""
+    html = (WORKBENCH_DIR / fname).read_text(encoding="utf-8")
+    bp = BASE_PATH if BASE_PATH.endswith("/") else BASE_PATH + "/"
+    if "<head>" in html:
+        html = html.replace("<head>", f'<head>\n<base href="{bp}">', 1)
+    return Response(html, media_type="text/html; charset=utf-8")
+
+
 if WORKBENCH_DIR.exists():
+    # ── 默认首页：面板编辑器（空白画布，上传图片开始做）──
     @app.get("/")
-    def index():
-        # 把 BASE_PATH 注入 <base>，让前端在任何子路径下都能正确加载资源
-        html = (WORKBENCH_DIR / "index.html").read_text(encoding="utf-8")
-        bp = BASE_PATH if BASE_PATH.endswith("/") else BASE_PATH + "/"
-        if "<head>" in html:
-            html = html.replace("<head>", f'<head>\n<base href="{bp}">', 1)
-        return Response(html, media_type="text/html; charset=utf-8")
+    def index_editor():
+        return _serve_workbench("editor.html")
+
+    # ── 旧工作台：小说自动改编结果的编辑界面，保留可访问 ──
+    @app.get("/workbench")
+    def index_workbench():
+        return _serve_workbench("index.html")
 
     app.mount("/static", StaticFiles(directory=str(WORKBENCH_DIR)), name="static")
 else:                                                       # pragma: no cover

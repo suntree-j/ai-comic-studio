@@ -8,7 +8,7 @@
 —— 用 **12 条业务规则 + 自修复循环** 解决 AI 生成漫画的
 **一致性 / 可编辑性 / 可复现性** 三大难题
 
-[![tests](https://img.shields.io/badge/tests-181%20passed-brightgreen)]()
+[![tests](https://img.shields.io/badge/tests-269%20passed-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 [![license](https://img.shields.io/badge/license-MIT-green)]()
 [![demo](https://img.shields.io/badge/🌐_在线_Demo-36.151.150.140%2Fcomic-4a9eff)](http://36.151.150.140/comic/)
@@ -25,16 +25,34 @@
 
 （京东云 4 核 16 GB，Nginx 子路径 `/comic/` + systemd，生图用 mock 避免额度被刷）
 
+这个项目提供**两套独立的东西**：
+
+| | **面板编辑器**（默认首页 `/`） | **小说自动改编**（`/workbench`） |
+|---|---|---|
+| 做什么 | 从**空白画布**手工做漫画：上传图片 → 拖到页面 → 加气泡 → 导出 | 把小说文本自动改成漫画 |
+| 代码 | `packages/editor/` | `packages/ir/` + `packages/agent/` |
+| 接口 | `/api/edit/*` | `/api/*` |
+| 文档 | [`docs/editor.md`](docs/editor.md) | [`docs/design.md`](docs/design.md) |
+
+两者互不依赖，只共用 `packages/render/`（字体、气泡避让算法、PDF 导出）作为底层。
+
+### 面板编辑器：Office 式的漫画编辑
+
+![编辑器](docs/images/editor.png)
+
+上传漫画图片 → 拖到画布 → 加气泡（自动避开人物）→ 调大小与顺序 → 导出 PDF。
+支持撤销、快捷键、五种气泡样式、元素叠放顺序与页面顺序。
+
+### 工作台：可视化编辑 Comic IR
+
+![工作台](docs/images/workbench.png)
+
 > **Demo 里的画面来自哪里？**
 > 取自已完成的《全职法师》漫画成品（168 页）。
 > 全书只有 **26 页画面没有烧进成品对白**，脚本会自动挑出这些页
 > （`scripts/make_showcase_project.py`：比例匹配 + 文字密度检测 + 擦除残留小字），
 > 这样叠加本系统自己的气泡才不会「文字叠文字」。
 > 另有 `demo` 项目用 Mock 占位图，用于离线验证渲染管线。
-
-### 工作台：可视化编辑 Comic IR
-
-![工作台](docs/images/workbench.png)
 
 左侧项目概览与**只读页码**（冻结机制），中间画布叠加**可拖拽的气泡框**，
 右侧对白编辑（说话人下拉 + 确认徽章 + 锁定开关）。
@@ -283,13 +301,17 @@ python scripts/clean_panels.py projects/showcase/assets/panels/*.png
 ```
 ai-comic-studio/
 ├── packages/
+│   ├── editor/              ★ 面板编辑器（Office 式，独立于 IR）
+│   │   ├── models.py            项目 / 页面 / 元素 / 素材
+│   │   ├── render.py            服务端渲染（含箭头几何、气泡自动高度）
+│   │   └── store.py             磁盘读写（原子写、防路径穿越）
 │   ├── ir/                  ★ Comic IR 数据模型 + 12 条规则校验
 │   ├── agent/               ★ AI 改漫 Agent
 │   │   ├── providers.py         LLM 适配器
 │   │   ├── prompts.py           提示词模板（规则前置 + 引用式）
 │   │   ├── skills.py            5 个技能 + 自修复循环
 │   │   └── pipeline.py          端到端编排
-│   ├── render/              ★ 渲染引擎
+│   ├── render/              ★ 渲染引擎（两条产品线共用的底层）
 │   │   ├── providers.py         生图适配器
 │   │   ├── prompt.py            三段式提示词组装
 │   │   ├── bubble.py            气泡布局算法
@@ -298,12 +320,17 @@ ai-comic-studio/
 │   │   └── studio.py            渲染编排
 │   └── cli.py               命令行
 ├── apps/
-│   ├── api/server.py        FastAPI 后端
-│   └── workbench/           可视化工作台（纯静态，零构建）
-├── tests/                   121 个测试
+│   ├── api/
+│   │   ├── server.py            漫画 IR 接口（/api/*）
+│   │   └── editor.py            面板编辑器接口（/api/edit/*，26 个）
+│   └── workbench/           前端（纯静态，零构建）
+│       ├── editor.html/css/js   ★ 面板编辑器（默认首页）
+│       └── index.html/app.js    旧工作台（/workbench）
+├── tests/                   269 个测试
 ├── examples/minimal/        最小可运行示例
 ├── docs/
 │   ├── design.md            完整方案与架构
+│   ├── editor.md            ★ 面板编辑器说明
 │   ├── lessons.md           ★ 实战踩坑复盘（五个结构性坑）
 │   ├── demo-script.md       ★ 演示手册（怎么展示 / 工作台设计 / 会被问什么）
 │   ├── modifying.md         ★ 改动指南（常见改动怎么做 / 红线 / 验证流程）
@@ -380,7 +407,8 @@ python scripts/verify_online.py
 | `test_frontend.py` | 8 | JS 语法（node --check）/ HTML 挂载点 / 前后端路由对齐 / README 图链 |
 | `test_pipeline.py` | 5 | 端到端编排 / 页码冻结 / pending 降级 |
 | `test_packaging.py` | 3 | **依赖声明与实际 import 一致** / extras 覆盖 / 包发现 |
-| | **181** | |
+| `test_editor.py` | **88** | 面板编辑器：模型 / 渲染几何（★ 箭头与包围盒回归）/ 接口 / 静态资源 |
+| | **269** | |
 
 ### 三个「只有上服务器才会暴露」的坑
 

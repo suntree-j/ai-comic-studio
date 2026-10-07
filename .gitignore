@@ -18,6 +18,7 @@ htmlcov/
 out/
 output/
 projects/
+works/
 *.pdf
 !docs/**/*.pdf
 *.png
@@ -29,6 +30,10 @@ projects/
 examples/**/finals/
 examples/**/panels/
 examples/**/assets/
+
+# 临时文件（下划线开头，是我排查问题时用的草稿）
+_*
+!__init__.py
 
 # 密钥
 .env

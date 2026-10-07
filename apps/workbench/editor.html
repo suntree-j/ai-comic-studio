@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>漫画面板编辑器 · AI Comic Studio</title>
+<!-- 服务端会注入 <base href="...">（如 /comic/）。
+     应用把 /static 映射到本目录，静态文件放在这一层。
+     <base href="/comic/"> + "static/editor.css"  →  /comic/static/editor.css
+     nginx proxy_pass 带尾斜杠剥掉 /comic        →  应用收到 /static/editor.css  ✓ -->
+<link rel="stylesheet" href="static/editor.css">
+</head>
+<body>
+
+<!-- ══════════ 顶部工具栏 ══════════ -->
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <b>漫画面板编辑器</b>
+  </div>
+
+  <div class="tools">
+    <select id="projectSel" title="切换项目"></select>
+    <button id="btnNew" class="ghost" title="新建空白项目">新建</button>
+
+    <span class="sep"></span>
+
+    <button id="btnUndo" class="ghost" title="撤销 (Ctrl+Z)">↶ 撤销</button>
+    <button id="btnPrev" class="ghost" title="上一页 (←)">‹</button>
+    <span id="pageLabel" class="page-label">—</span>
+    <button id="btnNext" class="ghost" title="下一页 (→)">›</button>
+
+    <span class="sep"></span>
+
+    <button id="btnFit" class="ghost" title="适应窗口">适应</button>
+    <button id="btn100" class="ghost" title="原始大小">100%</button>
+    <button id="btnZoomOut" class="ghost">−</button>
+    <span id="zoomLabel" class="zoom-label">—</span>
+    <button id="btnZoomIn" class="ghost">＋</button>
+
+    <span class="sep"></span>
+
+    <button id="btnExportPdf" class="primary" title="导出 PDF">导出 PDF</button>
+    <button id="btnExportImg" class="ghost" title="导出图片">图片</button>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ══════════ 左：素材 + 页面 ══════════ -->
+  <aside class="panel left">
+    <div class="tabs">
+      <button class="tab on" data-tab="assets">素材</button>
+      <button class="tab" data-tab="pages">页面</button>
+    </div>
+
+    <!-- 素材 -->
+    <section id="tab-assets" class="tab-body">
+      <div id="dropzone" class="dropzone">
+        <div class="dz-icon">⬆</div>
+        <div>把漫画图片拖到这里</div>
+        <div class="hint">或 <button id="btnPick" class="link">点击选择文件</button></div>
+        <div class="hint">支持多选 · PNG / JPG / WEBP</div>
+        <input id="fileInput" type="file" accept="image/*" multiple hidden>
+      </div>
+      <div class="sec-head">
+        <span>已上传 <b id="assetCount">0</b></span>
+        <button id="btnAddPageFromAssets" class="link" title="每张图新建一页">每张图一页</button>
+      </div>
+      <div id="assetList" class="asset-grid"></div>
+    </section>
+
+    <!-- 页面 -->
+    <section id="tab-pages" class="tab-body" hidden>
+      <div class="sec-head">
+        <span>共 <b id="pageCount">0</b> 页</span>
+        <button id="btnAddPage" class="link">＋ 加一页</button>
+      </div>
+      <div id="pageList" class="page-list"></div>
+      <div class="hint pad">
+        页码是**身份**，调顺序不会改变它 —— 这样「第 7 页」永远指同一页。
+      </div>
+    </section>
+  </aside>
+
+  <!-- ══════════ 中：画布 ══════════ -->
+  <section class="canvas-wrap">
+    <div id="canvasHost" class="canvas-host">
+      <div class="empty-canvas">
+        <div class="ec-icon">▢</div>
+        <div class="ec-title">空白画布</div>
+        <div class="ec-sub">左侧上传漫画图片，然后拖到画布上</div>
+        <div class="ec-actions">
+          <button id="btnEmptyUpload" class="primary">上传图片</button>
+          <button id="btnEmptyBubble" class="ghost">加一个气泡</button>
+        </div>
+        <div class="ec-tip">也可以直接把图片拖进这个区域</div>
+      </div>
+    </div>
+    <div class="canvas-status">
+      <span id="statusMsg">—</span>
+      <span class="kbd-hint">
+        <kbd>Del</kbd> 删除 · <kbd>Ctrl</kbd>+<kbd>Z</kbd> 撤销 ·
+        <kbd>Ctrl</kbd>+<kbd>D</kbd> 复制 · <kbd>←↑↓→</kbd> 微调 ·
+        <kbd>Ctrl</kbd>+<kbd>滚轮</kbd> 缩放
+      </span>
+    </div>
+  </section>
+
+  <!-- ══════════ 右：属性 / 元素 ══════════ -->
+  <aside class="panel right">
+    <div class="tabs">
+      <button class="tab on" data-tab="props">属性</button>
+      <button class="tab" data-tab="layers">元素 <b id="layerCount">0</b></button>
+    </div>
+
+    <!-- 属性 -->
+    <section id="tab-props" class="tab-body">
+      <div id="noSel" class="hint pad">
+        未选中元素。<br>
+        点画布上的元素来编辑它的属性；
+        点空白处取消选择。
+      </div>
+      <div id="props"></div>
+    </section>
+
+    <!-- 元素列表（顺序） -->
+    <section id="tab-layers" class="tab-body" hidden>
+      <div class="hint pad">从上到下 = 从上层到下层。用 ↑↓ 调整叠放顺序。</div>
+      <div id="layerList" class="layer-list"></div>
+    </section>
+  </aside>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="static/editor.js"></script>
+</body>
+</html>
