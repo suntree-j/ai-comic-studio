@@ -88,7 +88,9 @@ def step(t: str) -> None:
 def make_tarball() -> str:
     """只打包运行必需的文件（不含 docs/images、tests、.git）"""
     out = os.path.join(tempfile.gettempdir(), "aicomic-deploy.tar.gz")
-    include = ["packages", "apps", "pyproject.toml", "README.md", "LICENSE"]
+    # scripts 也要传：服务器上要用它生成示例内容
+    include = ["packages", "apps", "scripts", "pyproject.toml",
+               "README.md", "LICENSE"]
 
     def flt(ti: tarfile.TarInfo):
         base = os.path.basename(ti.name)
@@ -105,16 +107,31 @@ def make_tarball() -> str:
 
 
 def make_demo_tarball() -> str:
-    """打包示例项目（IR + Mock 素材）"""
+    """打包示例项目（漫画 IR 项目 + 面板编辑器的 works 项目）
+
+    ★ 不带 assets/ 里的缓存与 out/ 产物（可由数据重建，省流量）
+    """
     out = os.path.join(tempfile.gettempdir(), "aicomic-projects.tar.gz")
-    proj = os.path.join(ROOT, "projects")
-    if not os.path.isdir(proj):
+    groups = [(os.path.join(ROOT, "projects"), "projects"),
+              (os.path.join(ROOT, "works"), "works")]
+    if not any(os.path.isdir(d) for d, _ in groups):
         return ""
+
+    def flt(ti: tarfile.TarInfo):
+        name = ti.name.replace("\\", "/")
+        for skip in ("/out/", "/.cache/"):
+            if skip in name:
+                return None
+        return ti
+
     with tarfile.open(out, "w:gz") as tf:
-        for name in os.listdir(proj):
-            d = os.path.join(proj, name)
-            if os.path.isdir(d):
-                tf.add(d, arcname=f"projects/{name}")
+        for root, arc in groups:
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                d = os.path.join(root, name)
+                if os.path.isdir(d):
+                    tf.add(d, arcname=f"{arc}/{name}", filter=flt)
     return out
 
 
@@ -204,14 +221,18 @@ def prepare() -> None:
         print("   创建 venv 并安装依赖（约 1–3 分钟）…")
         sh(f"python3 -m venv {REMOTE_DIR}/venv")
     sh(f"{REMOTE_DIR}/venv/bin/pip install -q --upgrade pip")
-    # 依赖与 pyproject.toml 的 dependencies + web extra 保持一致
-    # （numpy 曾被漏掉：bubble.py 用到，本地早已装好所以没暴露）
+    # 依赖必须与 pyproject.toml 的 dependencies + web extra 完全一致。
+    # ★ 这里漏过两次：
+    #     numpy            —— packages/render/bubble.py 用到
+    #     python-multipart —— apps/api/editor.py 的 File/UploadFile 用到
+    #   两次都只在服务器上炸，因为本地早就装好了。
+    #   tests/test_packaging.py 会静态检查「所有第三方 import 都已声明」。
     sh(f"{REMOTE_DIR}/venv/bin/pip install -q "
-       "'fastapi>=0.110' 'uvicorn[standard]>=0.27' 'pydantic>=2.6' "
-       "'Pillow>=10.0' 'numpy>=1.24' 'fonttools>=4.40' "
+       "'fastapi>=0.110' 'uvicorn[standard]>=0.27' 'python-multipart>=0.0.9' "
+       "'pydantic>=2.6' 'Pillow>=10.0' 'numpy>=1.24' 'fonttools>=4.40' "
        "'pymupdf>=1.24' 'httpx>=0.27'")
     r = sh(f"{REMOTE_DIR}/venv/bin/python -c \""
-           f"import fastapi,uvicorn,PIL,pydantic,numpy,fontTools;"
+           f"import fastapi,uvicorn,PIL,pydantic,numpy,fontTools,multipart,httpx;"
            f"print('fastapi',fastapi.__version__,'pydantic',pydantic.VERSION,"
            f"'PIL',PIL.__version__,'numpy',numpy.__version__,"
            f"'fontTools',fontTools.version)\"")
@@ -247,14 +268,41 @@ def install_service() -> None:
 
     sh(f"chmod -R a+rX {REMOTE_DIR}")
     sh("systemctl daemon-reload")
-    sh("systemctl enable --now ai-comic-studio")
-    time.sleep(4)
-    r = sh("systemctl is-active ai-comic-studio", check=False)
-    print(f"   systemd 状态：{(r.stdout or '').strip()}")
-    if "active" not in (r.stdout or ""):
+    sh("systemctl enable ai-comic-studio")
+    # ★ 必须 stop + start，不能只 restart：
+    #   实测 `systemctl restart` 后立刻 `is-active` 会返回 active，
+    #   但新进程其实还没起来 —— 于是验证跑在**旧代码**上，
+    #   表现为「接口 404 但服务显示 active」，极难排查。
+    #   这里改成显式停+启，然后**轮询等接口真的通**。
+    sh("systemctl stop ai-comic-studio", check=False)
+    time.sleep(1)
+    sh("systemctl start ai-comic-studio")
+
+    probe = f"http://127.0.0.1:{PORT}/api/health"
+    ready = False
+    for i in range(30):
+        time.sleep(1)
+        r = sh(f"curl -s -o /dev/null -w '%{{http_code}}' {probe}", check=False)
+        if (r.stdout or "").strip() == "200":
+            print(f"   服务就绪（{i + 1} 秒）")
+            ready = True
+            break
+    if not ready:
         r = sh("journalctl -u ai-comic-studio -n 40 --no-pager", check=False)
+        print("   ❌ 服务未就绪，日志：")
         print((r.stdout or "")[-2000:])
         raise SystemExit(1)
+
+    # 再确认编辑器的新路由真的在（防止旧代码还在跑）
+    r = sh(f"curl -s -o /dev/null -w '%{{http_code}}' "
+           f"http://127.0.0.1:{PORT}/api/edit/projects", check=False)
+    code = (r.stdout or "").strip()
+    if code != "200":
+        print(f"   ❌ 编辑器接口返回 {code}（新代码没生效？）")
+        r = sh("journalctl -u ai-comic-studio -n 30 --no-pager", check=False)
+        print((r.stdout or "")[-1500:])
+        raise SystemExit(1)
+    print("   新路由已生效（/api/edit/projects → 200）")
 
 
 def install_nginx() -> None:
@@ -302,17 +350,24 @@ def install_nginx() -> None:
 
 
 def generate_assets() -> None:
-    step("⑤ 生成示例项目素材")
+    step("⑤ 生成示例内容")
     r = sh("ls -1 {0}/projects 2>/dev/null | wc -l".format(REMOTE_DIR), check=False)
     n = (r.stdout or "0").strip()
     if n not in ("0", ""):
-        print(f"   已有 {n} 个项目，跳过生成")
-        return
-    sh(f"cd {REMOTE_DIR} && mkdir -p projects && "
-       f"COMIC_PROJECTS={REMOTE_DIR}/projects "
-       f"{REMOTE_DIR}/venv/bin/python scripts/make_demo_project.py", check=False)
-    r = sh(f"ls -1 {REMOTE_DIR}/projects 2>/dev/null", check=False)
-    print("   项目：" + " ".join((r.stdout or "").split()))
+        print(f"   漫画 IR 项目已有 {n} 个，跳过生成")
+    else:
+        sh(f"cd {REMOTE_DIR} && mkdir -p projects && "
+           f"COMIC_PROJECTS={REMOTE_DIR}/projects "
+           f"{REMOTE_DIR}/venv/bin/python scripts/make_demo_project.py", check=False)
+        r = sh(f"ls -1 {REMOTE_DIR}/projects 2>/dev/null", check=False)
+        print("   IR 项目：" + " ".join((r.stdout or "").split()))
+
+    # 面板编辑器的示例项目 —— 让访客点开就看到效果，而不是空列表
+    r = sh(f"cd {REMOTE_DIR} && COMIC_WORKSPACE={REMOTE_DIR}/works "
+           f"{REMOTE_DIR}/venv/bin/python scripts/seed_demo_project.py",
+           check=False)
+    out = (r.stdout or "").strip()
+    print("   " + (out.splitlines()[-1] if out else "（编辑器示例跳过）"))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -344,6 +399,19 @@ def verify() -> int:
     chk("首页 /comic/", lambda: (
         lambda s, c, b: f"{s}  {len(b)} 字节  base={'/comic/' in b.decode('utf-8','replace')}"
     )(*fetch(PUBLIC)))
+    chk("首页是面板编辑器", lambda: (
+        lambda s, c, b: f"{s}  {'编辑器' if '面板编辑器' in b.decode('utf-8','replace') else '???'}"
+    )(*fetch(PUBLIC)))
+    chk("编辑器 JS", lambda: (
+        lambda s, c, b: f"{s}  {len(b)} 字节"
+    )(*fetch(PUBLIC + "static/editor.js")))
+    chk("编辑器 CSS", lambda: (
+        lambda s, c, b: f"{s}  {len(b)} 字节"
+    )(*fetch(PUBLIC + "static/editor.css")))
+    chk("编辑器接口", lambda: fetch(PUBLIC + "api/edit/projects")[2].decode()[:80])
+    chk("旧工作台 /workbench", lambda: (
+        lambda s, c, b: f"{s}  {'漫画工作台' in b.decode('utf-8','replace')}"
+    )(*fetch(PUBLIC + "workbench")))
     chk("静态 app.js", lambda: (
         lambda s, c, b: f"{s}  {len(b)} 字节"
     )(*fetch(PUBLIC + "static/app.js")))

@@ -5,7 +5,7 @@
 
 线上：**http://36.151.150.140/comic/**（默认打开的就是这个编辑器）
 
-![编辑器](images/editor.png)
+![编辑器](images/editor-live.png)
 
 ---
 
