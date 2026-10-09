@@ -5,6 +5,20 @@
 
 线上：**http://36.151.150.140/comic/**（默认打开的就是这个编辑器）
 
+**打开是空的，从 0 开始** —— 点「新建」建一个项目，然后上传你的漫画图片。
+需要演示用的示例项目时，手动跑一次：
+
+`ash
+python scripts/seed_demo_project.py            # 生成「示例漫画」项目
+python scripts/seed_demo_project.py --force    # 覆盖重建
+`
+
+打开时的样子（空白起点）：
+
+![空白起点](images/editor-empty.png)
+
+上传图片、加气泡后的效果：
+
 ![编辑器](images/editor-live.png)
 
 ---

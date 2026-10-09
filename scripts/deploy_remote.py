@@ -107,31 +107,27 @@ def make_tarball() -> str:
 
 
 def make_demo_tarball() -> str:
-    """打包示例项目（漫画 IR 项目 + 面板编辑器的 works 项目）
+    """打包漫画 IR 的演示项目（`projects/`）
 
-    ★ 不带 assets/ 里的缓存与 out/ 产物（可由数据重建，省流量）
+    ★ **不带 `works/`** —— 那是面板编辑器的数据，属于线上用户自己建的，
+      不该被本地文件覆盖。编辑器就应该从 0 开始。
     """
     out = os.path.join(tempfile.gettempdir(), "aicomic-projects.tar.gz")
-    groups = [(os.path.join(ROOT, "projects"), "projects"),
-              (os.path.join(ROOT, "works"), "works")]
-    if not any(os.path.isdir(d) for d, _ in groups):
+    proj = os.path.join(ROOT, "projects")
+    if not os.path.isdir(proj):
         return ""
 
     def flt(ti: tarfile.TarInfo):
         name = ti.name.replace("\\", "/")
-        for skip in ("/out/", "/.cache/"):
-            if skip in name:
-                return None
+        if "/out/" in name or "/.cache/" in name:
+            return None
         return ti
 
     with tarfile.open(out, "w:gz") as tf:
-        for root, arc in groups:
-            if not os.path.isdir(root):
-                continue
-            for name in os.listdir(root):
-                d = os.path.join(root, name)
-                if os.path.isdir(d):
-                    tf.add(d, arcname=f"{arc}/{name}", filter=flt)
+        for name in os.listdir(proj):
+            d = os.path.join(proj, name)
+            if os.path.isdir(d):
+                tf.add(d, arcname=f"projects/{name}", filter=flt)
     return out
 
 
@@ -350,24 +346,21 @@ def install_nginx() -> None:
 
 
 def generate_assets() -> None:
-    step("⑤ 生成示例内容")
-    r = sh("ls -1 {0}/projects 2>/dev/null | wc -l".format(REMOTE_DIR), check=False)
+    step("⑤ 生成示例内容（仅漫画 IR 演示用）")
+    # ★ 面板编辑器**不预置任何项目** —— 打开就是空白，从 0 开始。
+    #   （scripts/seed_demo_project.py 保留着，需要演示时手动跑一次：
+    #     COMIC_WORKSPACE=/opt/ai-comic-studio/works \
+    #       ./venv/bin/python scripts/seed_demo_project.py）
+    r = sh(f"ls -1 {REMOTE_DIR}/projects 2>/dev/null | wc -l", check=False)
     n = (r.stdout or "0").strip()
     if n not in ("0", ""):
         print(f"   漫画 IR 项目已有 {n} 个，跳过生成")
-    else:
-        sh(f"cd {REMOTE_DIR} && mkdir -p projects && "
-           f"COMIC_PROJECTS={REMOTE_DIR}/projects "
-           f"{REMOTE_DIR}/venv/bin/python scripts/make_demo_project.py", check=False)
-        r = sh(f"ls -1 {REMOTE_DIR}/projects 2>/dev/null", check=False)
-        print("   IR 项目：" + " ".join((r.stdout or "").split()))
-
-    # 面板编辑器的示例项目 —— 让访客点开就看到效果，而不是空列表
-    r = sh(f"cd {REMOTE_DIR} && COMIC_WORKSPACE={REMOTE_DIR}/works "
-           f"{REMOTE_DIR}/venv/bin/python scripts/seed_demo_project.py",
-           check=False)
-    out = (r.stdout or "").strip()
-    print("   " + (out.splitlines()[-1] if out else "（编辑器示例跳过）"))
+        return
+    sh(f"cd {REMOTE_DIR} && mkdir -p projects && "
+       f"COMIC_PROJECTS={REMOTE_DIR}/projects "
+       f"{REMOTE_DIR}/venv/bin/python scripts/make_demo_project.py", check=False)
+    r = sh(f"ls -1 {REMOTE_DIR}/projects 2>/dev/null", check=False)
+    print("   IR 项目：" + " ".join((r.stdout or "").split()))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -409,6 +402,7 @@ def verify() -> int:
         lambda s, c, b: f"{s}  {len(b)} 字节"
     )(*fetch(PUBLIC + "static/editor.css")))
     chk("编辑器接口", lambda: fetch(PUBLIC + "api/edit/projects")[2].decode()[:80])
+    chk("编辑器为空（从 0 开始）", lambda: _check_empty_editor())
     chk("旧工作台 /workbench", lambda: (
         lambda s, c, b: f"{s}  {'漫画工作台' in b.decode('utf-8','replace')}"
     )(*fetch(PUBLIC + "workbench")))
@@ -432,6 +426,21 @@ def verify() -> int:
     print(f"\n   {ok}/{len(checks)} 项通过")
     print(f"\n   👉 打开 {PUBLIC}")
     return 0 if ok == len(checks) else 1
+
+
+def _check_empty_editor() -> str:
+    """★ 面板编辑器必须是空的（从 0 开始）
+
+    这不是「忘了放示例」，而是刻意如此：
+    打开就该是一张空白画布，等用户上传自己的漫画图片。
+    """
+    import json as _json
+    items = _json.loads(fetch(PUBLIC + "api/edit/projects")[2])
+    if items:
+        names = ", ".join(x.get("name", "?") for x in items[:5])
+        raise AssertionError(f"编辑器里还有 {len(items)} 个项目：{names}"
+                             f"（应清空，从 0 开始）")
+    return "0 个项目 ✓"
 
 
 def _check_font() -> str:
