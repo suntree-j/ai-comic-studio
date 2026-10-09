@@ -69,6 +69,78 @@ def _wrap_cjk(text: str, font, max_w: float) -> List[str]:
     return lines or [""]
 
 
+def _fit_piece(src: Image.Image, tw: int, th: int, fit: FitMode) -> Image.Image:
+    """把素材裁/缩到目标框（与渲染完全同源）
+
+    ★ 抽出来单独放，是为了让「算包围盒」和「画图」用**同一套**逻辑 ——
+      否则前端的选择框迟早和画面对不上（这个项目已经栽过两次）。
+    """
+    tw, th = max(1, int(round(tw))), max(1, int(round(th)))
+    if fit is FitMode.FILL:
+        return src.resize((tw, th), Image.LANCZOS)
+    sw, sh = src.size
+    scale = (max(tw / sw, th / sh) if fit is FitMode.COVER
+             else min(tw / sw, th / sh))
+    nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+    scaled = src.resize((nw, nh), Image.LANCZOS)
+    piece = Image.new("RGB", (tw, th), (255, 255, 255))
+    piece.paste(scaled, ((tw - nw) // 2, (th - nh) // 2))
+    return piece
+
+
+def _render_image_piece(el: ImageElement, img: Image.Image,
+                        W: int, H: int) -> Image.Image:
+    """算出这个图片元素最终会被贴上去的那块图（像素）
+
+    ★ 这是唯一的真相来源：`_draw_image_el` 画它，`image_box` 量它。
+      之前算包围盒是另写一套公式，于是旋转、裁剪、cover/contain
+      任何一种情况都可能对不上。
+    """
+    w = el.w * W
+    h = (el.h * H) if el.h else (w * img.height / max(1, img.width))
+    src = img.convert("RGB")
+
+    if el.crop:
+        l, t, r, b = el.crop
+        sw, sh = src.size
+        box = (int(l * sw), int(t * sh), int((1 - r) * sw), int((1 - b) * sh))
+        if box[2] > box[0] and box[3] > box[1]:
+            src = src.crop(box)
+
+    piece = _fit_piece(src, w, h, el.fit)
+    if el.flip_h:
+        piece = piece.transpose(Image.FLIP_LEFT_RIGHT)
+    if el.rotation:
+        # expand=True → 返回的尺寸就是旋转后的外接矩形
+        piece = piece.rotate(-el.rotation, expand=True, resample=Image.BICUBIC,
+                             fillcolor=(255, 255, 255))
+    return piece
+
+
+def image_box(el: ImageElement, img: Optional[Image.Image],
+              page_wh: Tuple[int, int]) -> Optional[Tuple[float, float,
+                                                          float, float]]:
+    """图片元素的完整包围盒 (x, y, w, h)，归一化
+
+    ★ 直接量「最终要贴上去的那块图」的尺寸：
+      旋转会让外接矩形变大（横图转 90° 后，盒子高度变成原来的宽），
+      裁剪、cover/contain 也会改变可见范围。
+      以前是另写一套公式去估（旋转那条甚至是拍脑袋的 `* 1.4`），
+      实测旋转 90° 时盒子比实际小 28%，选择框框不住图。
+
+      素材取不到时返回 None（让调用方跳过，别画一个点不到的空框）。
+    """
+    if img is None:
+        return None
+    pw, ph = page_wh
+    if not pw or not ph:
+        return None
+    if el.h and not el.rotation:
+        return (el.x, el.y, el.w, el.h)
+    piece = _render_image_piece(el, img, pw, ph)
+    return (el.x, el.y, piece.width / pw, piece.height / ph)
+
+
 def _image_box_h(el: ImageElement, img: Image.Image,
                  page_wh: Tuple[int, int]) -> float:
     """图片元素的包围盒高度（归一化，相对画布高）
@@ -81,15 +153,8 @@ def _image_box_h(el: ImageElement, img: Image.Image,
       最初写成把 `el.w * W`（像素宽）直接当成比例高返回，
       结果前端画出的选择框比实际图片高出一大截。
     """
-    if el.h:
-        return el.h
-    pw, ph = page_wh
-    if not ph:
-        return el.w
-    if el.rotation:
-        # 旋转后外接矩形会变大，给个保守估计
-        return min(2.0, el.w * (pw / ph) * 1.4)
-    return el.w * (pw / ph) * (img.height / max(1, img.width))
+    bx = image_box(el, img, page_wh)
+    return bx[3] if bx else 0.0
 
 
 def bubble_geometry(el: BubbleElement, W: int, H: int
@@ -124,38 +189,10 @@ def _draw_image_el(canvas: Image.Image, el: ImageElement,
                    img: Optional[Image.Image], W: int, H: int) -> None:
     if img is None:
         return
-    x, y = el.x * W, el.y * H
-    w = el.w * W
-    h = (el.h * H) if el.h else (w * img.height / max(1, img.width))
-    src = img.convert("RGB")
-
-    if el.crop:
-        l, t, r, b = el.crop
-        sw, sh = src.size
-        box = (int(l * sw), int(t * sh), int((1 - r) * sw), int((1 - b) * sh))
-        if box[2] > box[0] and box[3] > box[1]:
-            src = src.crop(box)
-
-    tw, th = max(1, int(round(w))), max(1, int(round(h)))
-    if el.fit is FitMode.FILL:
-        piece = src.resize((tw, th), Image.LANCZOS)
-    else:
-        sw, sh = src.size
-        scale = (max(tw / sw, th / sh) if el.fit is FitMode.COVER
-                 else min(tw / sw, th / sh))
-        nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
-        scaled = src.resize((nw, nh), Image.LANCZOS)
-        piece = Image.new("RGB", (tw, th), (255, 255, 255))
-        piece.paste(scaled, ((tw - nw) // 2, (th - nh) // 2))
-
-    if el.flip_h:
-        piece = piece.transpose(Image.FLIP_LEFT_RIGHT)
+    piece = _render_image_piece(el, img, W, H)
     if el.opacity < 1.0:
         piece = Image.blend(Image.new("RGB", piece.size, (255, 255, 255)),
                             piece, el.opacity)
-    if el.rotation:
-        piece = piece.rotate(-el.rotation, expand=True, resample=Image.BICUBIC,
-                             fillcolor=(255, 255, 255))
 
     px, py = int(round(W * el.x)), int(round(H * el.y))
     if el.shadow:
@@ -443,8 +480,10 @@ def render_page(page: Page, load_asset: AssetLoader,
             if img is None:
                 continue
             _draw_image_el(canvas, el, img, W, H)
-            boxes[el.id] = [el.x, el.y, el.w,
-                            _image_box_h(el, img, (page.width, page.height))]
+            # 用 image_box 而非直接写 el.w：旋转后外接矩形会变宽
+            bx = image_box(el, img, (page.width, page.height))
+            if bx is not None:
+                boxes[el.id] = list(bx)
         elif isinstance(el, BubbleElement):
             x, y, w, h = _draw_bubble_el(canvas, el, W, H)
             boxes[el.id] = [el.x, el.y, w / W, h / H]

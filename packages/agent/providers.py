@@ -306,6 +306,10 @@ _PRESETS = {
     "moonshot": ("https://api.moonshot.cn/v1",     "MOONSHOT_API_KEY",  "moonshot-v1-32k"),
     "dashscope": ("https://dashscope.aliyuncs.com/compatible-mode/v1",
                   "DASHSCOPE_API_KEY", "qwen-plus"),
+    # 硅基流动：国内可直连，**同一个 key 同时提供 LLM 与生图**，
+    # 所以「小说 → 漫画」整条链路可以只配一个 key 就跑通。
+    "siliconflow": ("https://api.siliconflow.cn/v1",
+                    "SILICONFLOW_API_KEY", "Qwen/Qwen2.5-72B-Instruct"),
     "ollama":   ("http://localhost:11434/v1",      None,                "qwen2.5:14b"),
 }
 

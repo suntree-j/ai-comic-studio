@@ -116,12 +116,35 @@ class ComicPipeline:
         )
         log += ["对白：" + h for h in dlg_res.history]
 
-        if not dlg_res.ok or dlg_res.value is None:
-            return ChapterResult(chapter_id, title, storyboard, None,
-                                 "pending_human", sb_res.attempts + dlg_res.attempts,
-                                 log, dlg_res.final_report)
+        # ★ 取 repair 的最后产物来核对，而不是直接认输
+        #   为什么：`source_span` 与 `confirmed` 本来就**不该问 LLM** ——
+        #   LLM 数不准 2616 字原文的行号，所以它一律填 null / false，
+        #   于是自修复循环跑满 3 轮仍全被 IR-006 / IR-007 拒掉，
+        #   最后 pipeline 拿到空对白，成品漫画上一个字都没有。
+        #   这两件事系统能确定性算出来：回原文找这句话，找到就回填行号。
+        candidate = dlg_res.value if dlg_res.ok else dlg_res.pending
+        dialogue: Optional[DialogueBook] = None
+        if candidate is not None:
+            dialogue, vrep = S.verify_dialogue_against_source(
+                candidate, S.split_lines(text), start_line, self.bible)
+            n = sum(len(v) for v in dialogue.items.values())
+            log.append(f"对白核对：保留 {n} 条，"
+                       f"原文找不到 {len(vrep['dropped_not_in_source'])} 条，"
+                       f"说话人不存在 {len(vrep['dropped_unknown_speaker'])} 条")
+            if o.verbose:
+                print(f"   [对白] 回原文核对 → 保留 {n} 条"
+                      f"（丢弃 {len(vrep['dropped_not_in_source'])} 条查无实据、"
+                      f"{len(vrep['dropped_unknown_speaker'])} 条说话人不存在）")
+                for pid, txt in vrep["dropped_not_in_source"][:3]:
+                    print(f"          ✗ {pid} 原文里没有：「{txt}」")
+            if not dialogue.items:
+                dialogue = None
 
-        dialogue: DialogueBook = dlg_res.value
+        if dialogue is None:
+            return ChapterResult(chapter_id, title, storyboard, None,
+                                 "pending_human",
+                                 sb_res.attempts + dlg_res.attempts,
+                                 log, dlg_res.final_report)
 
         # ③ 状态追踪（尽力而为，失败不阻塞）
         try:

@@ -393,3 +393,96 @@ def make_dialogue_validator(bible: Bible, storyboard: Storyboard,
         return r
 
     return _v
+
+
+# ══════════════════════════════════════════════════════════════════
+# Skill 3.5 · 回原文核对（★ 不让 LLM 自己数行号）
+# ══════════════════════════════════════════════════════════════════
+
+def _norm_for_match(s: str) -> str:
+    """去掉引号与空白，只留正文字符，用于比对"""
+    return "".join(ch for ch in (s or "")
+                   if ch not in "「」『』“”\"' \t\u3000\n\r")
+
+
+def locate_in_source(text: str, source_lines: Sequence[str],
+                     start_line: int = 1) -> Optional[List[int]]:
+    """在一章原文里找到这句话，返回行号区间 [起, 止]（1-based）
+
+    先按行找；找不到就把整章的正文拼起来再找（应对原文里换行的长句）。
+    """
+    want = _norm_for_match(text)
+    if not want:
+        return None
+    # ① 逐行找（最常见）
+    for i, ln in enumerate(source_lines):
+        if want in _norm_for_match(ln):
+            n = start_line + i
+            return [n, n]
+    # ② 跨行找：把所有行拼成一个字符串，记录每行的起止偏移
+    joined, spans = [], []
+    for i, ln in enumerate(source_lines):
+        piece = _norm_for_match(ln)
+        spans.append((len("".join(joined)), len("".join(joined)) + len(piece)))
+        joined.append(piece)
+    whole = "".join(joined)
+    pos = whole.find(want)
+    if pos < 0:
+        return None
+    end = pos + len(want) - 1
+    first = next((i for i, (a, b) in enumerate(spans) if a <= pos < b), 0)
+    last = next((i for i, (a, b) in enumerate(spans) if a <= end < b), first)
+    return [start_line + first, start_line + last]
+
+
+def verify_dialogue_against_source(
+    dlg: DialogueBook,
+    source_lines: Sequence[str],
+    start_line: int = 1,
+    bible: Optional[Bible] = None,
+) -> tuple:
+    """★ 把 source_span / confirmed 从「问 LLM」改成「系统自己算」
+
+    为什么必须这样（真实事故）：
+        DeepSeek-V3.2 对一章 7 条对白**全部**填 `confirmed=false` +
+        `source_span=null`。而 IR-006 要求说话人已确认、IR-007 要求可追溯，
+        于是自修复循环跑满 3 轮仍全被拒 → `dlg_res.value=None` →
+        pipeline 拿到空对白 → **成品漫画上一个字都没有**。
+
+    但这两个字段本来就**不该问 LLM**：
+      · LLM 数不准行号（没人能可靠地对 2616 字原文数行），
+        所以它保守地填 null —— 这是合理行为，不是模型的错，是设计的问题。
+      · 而这两件事系统完全可以自己确定性地算出来。
+
+    这里：
+      · 能在原文里找到 → 回填真实行号，并置 confirmed=true
+      · 找不到         → 说明 LLM 编了台词（IR-007 防的就是这个），**丢弃该条**
+      · 说话人不在角色表 → 丢弃（不能渲染一个不存在的人）
+
+    返回 (处理后的 DialogueBook, 报告 dict)
+    """
+    kept: Dict[str, List[Utterance]] = {}
+    dropped_not_found, dropped_unknown, spans = [], [], 0
+    # characters 是 {角色id: Character} 的字典
+    known = set(bible.characters) if bible else None
+
+    for pid, utts in (dlg.items or {}).items():
+        for u in utts:
+            if known is not None and u.who and u.who not in known:
+                dropped_unknown.append((pid, u.who, u.text[:24]))
+                continue
+            span = locate_in_source(u.text, source_lines, start_line)
+            if span is None:
+                dropped_not_found.append((pid, u.text[:32]))
+                continue
+            u.source_span = span
+            u.confirmed = True          # 原文核对通过 = 说话人可确认
+            spans += 1
+            kept.setdefault(pid, []).append(u)
+
+    report = {
+        "kept": spans,
+        "dropped_not_in_source": dropped_not_found,
+        "dropped_unknown_speaker": dropped_unknown,
+    }
+    return DialogueBook(items=kept), report

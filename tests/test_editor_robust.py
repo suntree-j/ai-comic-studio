@@ -392,3 +392,155 @@ def test_rgba_png_saved_as_jpeg_ext_does_not_crash(tmp_path):
     assert a.width == 80
     loaded = st.load_asset_image("p", a.stored_name)
     assert loaded is not None and loaded.mode == "RGB"
+
+
+# ══════════════════════════════════════════════════════════════════
+# ⑥ 包围盒必须真的框住画出来的内容
+# ══════════════════════════════════════════════════════════════════
+
+def _measure_painted(img, bg_sum=150):
+    """量出图上「画了东西」的像素范围，归一化返回 (x, y, w, h)"""
+    import numpy as np
+    a = np.asarray(img).astype(int)
+    mask = a.sum(axis=2) > bg_sum
+    ys, xs = np.where(mask)
+    if not len(xs):
+        return None
+    W, H = img.size
+    return (xs.min() / W, ys.min() / H,
+            (xs.max() - xs.min() + 1) / W, (ys.max() - ys.min() + 1) / H)
+
+
+#: 深色底 + 纯亮图 → 亮像素的并集就是元素的外接矩形
+_BRIGHT = None
+
+
+def _bright_image():
+    global _BRIGHT
+    if _BRIGHT is None:
+        _BRIGHT = Image.new("RGB", (1600, 900), (250, 250, 250))
+    return _BRIGHT
+
+
+@pytest.mark.parametrize("name,kw", [
+    ("rot0", {"w": 0.5, "rotation": 0, "fit": "fill"}),
+    ("rot15", {"w": 0.5, "rotation": 15, "fit": "fill"}),
+    ("rot30", {"w": 0.5, "rotation": 30, "fit": "fill"}),
+    ("rot45", {"w": 0.5, "rotation": 45, "fit": "fill"}),
+    ("rot60", {"w": 0.5, "rotation": 60, "fit": "fill"}),
+    ("rot90", {"w": 0.5, "rotation": 90, "fit": "fill"}),
+    ("rot135", {"w": 0.5, "rotation": 135, "fit": "fill"}),
+    ("rot180", {"w": 0.5, "rotation": 180, "fit": "fill"}),
+    ("fit_fill", {"w": 0.5, "h": 0.3, "fit": "fill"}),
+    ("fit_cover", {"w": 0.5, "h": 0.3, "fit": "cover"}),
+    ("fit_contain", {"w": 0.5, "h": 0.3, "fit": "contain"}),
+    ("crop", {"w": 0.5, "h": 0.3, "fit": "fill",
+              "crop": (0.2, 0.1, 0.2, 0.1)}),
+    ("crop_rot30", {"w": 0.5, "h": 0.3, "rotation": 30, "fit": "fill",
+                    "crop": (0.2, 0.1, 0.2, 0.1)}),
+    ("crop_flip", {"w": 0.5, "h": 0.3, "fit": "fill", "flip_h": True,
+                   "crop": (0.1, 0.1, 0.1, 0.1)}),
+])
+def test_image_box_matches_painted_pixels(name, kw):
+    """★ 回归：接口返回的包围盒必须真的框住画出来的内容
+
+    为什么单独立一条：
+        「画」和「量」曾经是两套算法（`_draw_image_el` 一套、
+        `_image_box_h` 一套），于是旋转/裁剪/cover 任一情况下选择框都可能
+        和画面对不上 —— 旋转 90° 时盒子比实际小 28%，
+        而接口照样返回 200，只有肉眼看图才发现。
+
+        现在两者共用 `_render_image_piece`，这条测试就是那个不变式的守门员：
+        谁要是又把它拆成两套，这里会红。
+    """
+    from packages.editor import ImageElement, Page, render_page
+
+    pg = Page(number=1, width=1400, height=2000, background="#0a0a0a")
+    pg.elements = [ImageElement(id="e", asset_id="a", x=0.15, y=0.2, **kw)]
+    img, boxes = render_page(pg, lambda i: _bright_image(), 1000,
+                             with_boxes=True)
+    bx = boxes.get("e")
+    assert bx is not None, f"{name}: 没有返回包围盒"
+
+    painted = _measure_painted(img)
+    assert painted is not None, f"{name}: 什么都没画出来"
+
+    err = max(abs(painted[2] - bx[2]), abs(painted[3] - bx[3]))
+    assert err < 0.012, (
+        f"{name}: 盒子 {bx[2]:.3f}x{bx[3]:.3f} 但画出来的是 "
+        f"{painted[2]:.3f}x{painted[3]:.3f}（差 {err:.4f}）")
+
+
+def test_image_box_uses_same_source_as_drawing():
+    """结构保证：画和量必须来自同一个函数，不能各写一套"""
+    src = open(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "packages", "editor", "render.py"),
+        encoding="utf-8").read()
+    assert "_render_image_piece" in src
+    # _draw_image_el 里不该再出现自己那一套 resize/rotate
+    i = src.index("def _draw_image_el(")
+    j = src.index("\ndef ", i + 10)
+    body = src[i:j]
+    assert "_render_image_piece" in body, "画的时候必须用 _render_image_piece"
+    assert ".rotate(" not in body, "旋转逻辑只能有一处"
+    assert ".resize(" not in body, "缩放逻辑只能有一处"
+
+
+def test_image_box_rotation_is_not_guessed():
+    """★ 回归：旋转后的包围盒不能再用拍脑袋的系数估
+
+    曾经写成 `base * 1.4`（那个分支注释还写着「给个保守估计」）。
+    实际数学是外接矩形：
+        W' = |w·cosθ| + |h·sinθ|      H' = |w·sinθ| + |h·cosθ|
+
+    ★ 这里有个容易栽跟头的归一化细节：
+      宽度按 page_w 归一、高度按 page_h 归一，两者**尺度不同**。
+      所以「转 90° 后新高度 == 旧宽度那个数」是**错的**。
+      实测：0° 时 700x394 → 盒子 (0.500, 0.197)；
+            90° 时 394x700 → 盒子 (0.281, 0.350)。
+      0.350 ≠ 0.500 —— 要换成像素再比才对。
+    """
+    from packages.editor import ImageElement
+    from packages.editor.render import image_box
+
+    img = Image.new("RGB", (1600, 900), (250, 250, 250))
+    page_wh = (1400, 2000)
+    pw, ph = page_wh
+    flat = image_box(ImageElement(id="e", asset_id="a", w=0.5, rotation=0),
+                     img, page_wh)
+    # 横图：宽 0.5，高 = 0.5 * (1400/2000) * (900/1600) = 0.1969
+    assert abs(flat[2] - 0.5) < 1e-6
+    assert abs(flat[3] - 0.196875) < 0.002
+
+    turned = image_box(ImageElement(id="e", asset_id="a", w=0.5, rotation=90),
+                       img, page_wh)
+    # 转 90° → 宽高互换（换成像素再比）
+    assert abs(turned[2] * pw - flat[3] * ph) < 2.0, \
+        f"转 90° 后宽度(px)应≈原高(px)：{turned[2] * pw:.1f} vs {flat[3] * ph:.1f}"
+    assert abs(turned[3] * ph - flat[2] * pw) < 2.0, \
+        f"转 90° 后高度(px)应≈原宽(px)：{turned[3] * ph:.1f} vs {flat[2] * pw:.1f}"
+
+    # 更一般地：任何角度都该满足外接矩形公式（不手算期望值，避免又写错）
+    import math
+    for deg in (15, 30, 45, 60, 135):
+        b = image_box(ImageElement(id="e", asset_id="a", w=0.5, rotation=deg),
+                      img, page_wh)
+        rad = math.radians(deg)
+        w0, h0 = flat[2] * pw, flat[3] * ph          # 未旋转时的像素尺寸
+        want_w = abs(w0 * math.cos(rad)) + abs(h0 * math.sin(rad))
+        want_h = abs(w0 * math.sin(rad)) + abs(h0 * math.cos(rad))
+        assert abs(b[2] * pw - want_w) < 3.0, \
+            f"{deg}° 宽 {b[2] * pw:.1f} vs 公式 {want_w:.1f}"
+        assert abs(b[3] * ph - want_h) < 3.0, \
+            f"{deg}° 高 {b[3] * ph:.1f} vs 公式 {want_h:.1f}"
+
+    # 45° 时外接矩形最大，必须比 0° 和 90° 都高（旧公式做不到这点）
+    d45 = image_box(ImageElement(id="e", asset_id="a", w=0.5, rotation=45),
+                    img, page_wh)
+    assert d45[3] > flat[3] and d45[3] > turned[3], \
+        "45° 的外接矩形应比 0° 和 90° 都高"
+
+    # 绝不能是「原高度 × 某个常数」那种估法：
+    # 真值 0.35，旧公式 0.1969*1.4 = 0.2757
+    assert abs(turned[3] - 0.196875 * 1.4) > 0.05, \
+        "看着还像老的 *1.4 估法"

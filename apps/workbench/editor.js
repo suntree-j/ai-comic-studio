@@ -19,12 +19,29 @@ const S = {
   projects: [],
   proj: null,          // 项目数据
   page: null,          // 当前页
-  sel: null,           // 选中元素 id
+  sel: null,           // 主选中元素 id（属性面板显示它）
+  sels: new Set(),     // ★ 多选集合（含 sel）
   boxes: {},           // element_id -> [x,y,w,h] 归一化（服务端给的）
   drag: null,
   zoom: 1,             // 1 = 适应窗口
   busy: false,
+  revision: null,      // ★ 乐观并发：服务端当前版本号
+  guides: [],          // ★ 当前显示的对齐参考线 {x|y, pos}
 };
+
+//: 吸附阈值（画布宽/高的比例）
+const SNAP = 0.008;
+//: 对齐线候选（相对画布）：左 / 中 / 右、上 / 中 / 下
+const SNAP_X = [0, 0.5, 1];
+const SNAP_Y = [0, 0.5, 1];
+
+//: 裁剪后每个方向至少保留的比例
+//  ★ 服务端按 int() 取整（render.py:135），保留太少会被截成 0 像素 ——
+//    那时 `box[2] > box[0]` 不成立，整段裁剪被**静默忽略**，用户会以为功能坏了。
+const CROP_MIN = 0.03;
+
+//: 当前裁剪会话（null = 不在裁剪中）。见「裁剪」一节。
+let cropState = null;
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
@@ -98,7 +115,8 @@ async function openProject(name) {
     S.proj = await api('/api/edit/projects/' + encodeURIComponent(name));
     const pages = orderedPages();
     S.page = pages[0] || null;
-    S.sel = null;
+    S.revision = S.proj.revision != null ? S.proj.revision : null;
+    setSelection([], null);
     await loadProjects(name);
     renderAssets();
     renderPages();
@@ -124,7 +142,7 @@ async function showPage(pageId) {
   const p = S.proj.pages.find(x => x.id === pageId);
   if (!p) { renderEmpty(); return; }
   S.page = p;
-  S.sel = null;
+  setSelection([], null);
   renderPages();
   renderLayers();
   renderProps();
@@ -164,6 +182,7 @@ async function drawCanvas(fast) {
   const host = $('#canvasHost');
 
   if (!S.page.elements.length) {
+    if (cropState) exitCrop();          // 页里没东西了，裁剪框就没有意义了
     host.innerHTML = EMPTY_HTML;
     const bind = (id, fn) => { const b = $(id); if (b) b.onclick = fn; };
     bind('#ecUpload', () => $('#fileInput').click());
@@ -204,12 +223,17 @@ async function drawCanvas(fast) {
     holder.appendChild(makeOverlay(e, b));
   });
 
-  // ④ 点空白取消选择
+  // ④ 点空白：取消选择，拖动则框选
   holder.onpointerdown = (ev) => {
-    if (ev.target === holder || ev.target === im) {
-      S.sel = null; renderProps(); renderLayers(); refreshSel();
-    }
+    if (ev.target !== holder && ev.target !== im) return;
+    if (cropState) return;              // 裁剪中点空白不算取消选择（否则框会突然消失）
+    if (!ev.shiftKey) setSelection([], null);
+    renderProps(); renderLayers(); refreshSel();
+    startMarquee(ev, holder);
   };
+
+  // ⑤ 裁剪框（重绘会把 holder 换掉，所以这里重新挂一次）
+  if (cropState) attachCropUi();
 
   $('#layerCount').textContent = String(S.page.elements.length);
   updatePageLabel();
@@ -224,7 +248,7 @@ function orderedByZ() {
 
 function makeOverlay(e, box) {
   const [x, y, w, h] = box;
-  const n = el('div', 'ov' + (S.sel === e.id ? ' sel' : '') + (e.locked ? ' locked' : ''));
+  const n = el('div', 'ov' + (isSelected(e.id) ? ' sel' : '') + (e.locked ? ' locked' : ''));
   n.dataset.eid = e.id;
   n.style.cssText =
     `left:${x * 100}%;top:${y * 100}%;width:${w * 100}%;height:${h * 100}%`;
@@ -282,38 +306,148 @@ function applyZoom(holder) {
 }
 
 function refreshSel() {
-  $$('.ov').forEach(n => n.classList.toggle('sel', n.dataset.eid === S.sel));
+  $$('.ov').forEach(n => n.classList.toggle('sel', isSelected(n.dataset.eid)));
+  refreshSelInfo();
+}
+
+/** 画布下方显示「选中了几个」 */
+function refreshSelInfo() {
+  const b = selectionBounds();
+  if (!b) { status(''); return; }
+  if (b.n > 1) {
+    status(`已选中 ${b.n} 个元素　可以一起拖动；Del 批量删除；Esc 取消`);
+  }
 }
 
 /* ── 拖动 ─────────────────────────────────────── */
 function startDrag(ev, e) {
+  // Shift 点选：加/减选，不进入拖动
+  if (ev.shiftKey) {
+    ev.preventDefault(); ev.stopPropagation();
+    const next = new Set(S.sels);
+    if (next.has(e.id)) next.delete(e.id); else next.add(e.id);
+    setSelection(Array.from(next), next.has(e.id) ? e.id : null);
+    refreshSel(); renderProps(); renderLayers();
+    return;
+  }
   if (e.locked) { toast('该元素已锁定'); return; }
   ev.preventDefault(); ev.stopPropagation();
-  S.sel = e.id; refreshSel(); renderProps(); renderLayers();
+
+  // 点未选中的元素 → 只选它；点已选中的 → 保持整组
+  if (!isSelected(e.id)) setSelection([e.id], e.id);
+  else S.sel = e.id;
+  refreshSel(); renderProps(); renderLayers();
 
   const holder = $('.page-holder');
   const rect = holder.getBoundingClientRect();
-  const node = holder.querySelector(`.ov[data-eid="${e.id}"]`);
-  const start = { mx: ev.clientX, my: ev.clientY, x: e.x, y: e.y };
+  const group = selectedEls();
+  const bounds0 = selectionBounds();
+  // 其他元素的盒子（吸附参考）
+  const others = S.page.elements
+    .filter(x => !S.sels.has(x.id) && S.boxes[x.id])
+    .map(x => S.boxes[x.id]);
+
+  const start = {
+    mx: ev.clientX, my: ev.clientY,
+    pos: group.map(x => ({ el: x, x: x.x, y: x.y })),
+    bounds: bounds0,
+  };
   let moved = false;
 
   const onMove = (ev2) => {
-    const dx = (ev2.clientX - start.mx) / rect.width;
-    const dy = (ev2.clientY - start.my) / rect.height;
+    let dx = (ev2.clientX - start.mx) / rect.width;
+    let dy = (ev2.clientY - start.my) / rect.height;
     if (Math.abs(dx) > 0.002 || Math.abs(dy) > 0.002) moved = true;
-    e.x = round(clamp(start.x + dx, -0.5, 1.5));
-    e.y = round(clamp(start.y + dy, -0.5, 1.5));
-    node.style.left = e.x * 100 + '%';
-    node.style.top = e.y * 100 + '%';
-    syncTail(e);
-    status(`x ${(e.x * 100).toFixed(1)}%  y ${(e.y * 100).toFixed(1)}%`);
+
+    // ★ 吸附：把整组的移动后包围盒拉到对齐线上
+    if (start.bounds) {
+      const moved_b = {
+        x0: start.bounds.x0 + dx, y0: start.bounds.y0 + dy,
+        x1: start.bounds.x1 + dx, y1: start.bounds.y1 + dy,
+      };
+      const snap = snapMove(moved_b, others);
+      dx += snap.dx; dy += snap.dy;
+      S.guides = snap.guides;
+      drawGuides(holder);
+    }
+
+    start.pos.forEach(({ el: x, x: sx, y: sy }) => {
+      x.x = round(clamp(sx + dx, -0.5, 1.5));
+      x.y = round(clamp(sy + dy, -0.5, 1.5));
+      const n2 = holder.querySelector(`.ov[data-eid="${x.id}"]`);
+      if (n2) { n2.style.left = x.x * 100 + '%'; n2.style.top = x.y * 100 + '%'; }
+      syncTail(x);
+    });
+    const b = selectionBounds();
+    if (b) {
+      status(b.n > 1
+        ? `已选 ${b.n} 个　整体 x ${(b.x0 * 100).toFixed(1)}% y ${(b.y0 * 100).toFixed(1)}%`
+        : `x ${(e.x * 100).toFixed(1)}%  y ${(e.y * 100).toFixed(1)}%`);
+    }
   };
   const onUp = async () => {
     window.removeEventListener('pointermove', onMove);
     window.removeEventListener('pointerup', onUp);
+    clearGuides();
     if (!moved) { status(''); return; }
-    await saveProps(e.id, { x: e.x, y: e.y });
+    // 多个元素用 batch-move 一次提交（一条请求，一个 revision）
+    const moves = {};
+    start.pos.forEach(({ el: x }) => { moves[x.id] = { x: x.x, y: x.y }; });
+    if (Object.keys(moves).length === 1) {
+      await saveProps(e.id, { x: e.x, y: e.y });
+    } else {
+      await batchMove(moves);
+    }
     status('');
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/** 一次提交多个元素的位置 */
+async function batchMove(moves) {
+  try {
+    const r = await api(url(`/api/edit/projects/${S.proj.name}/elements/batch-move`
+      + (S.revision != null ? `?revision=${S.revision}` : '')), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ moves }),
+    });
+    if (r.revision != null) S.revision = r.revision;
+  } catch (e) { toast('移动失败：' + e.message + '（F5 刷新可看到服务器上的最新内容）', true); }
+}
+
+/** 框选：在空白处按下拖动，画一个矩形选住相交的元素 */
+function startMarquee(ev, holder) {
+  const rect = holder.getBoundingClientRect();
+  const box = el('div', 'marquee');
+  holder.appendChild(box);
+  const x0 = ev.clientX - rect.left, y0 = ev.clientY - rect.top;
+  const base = new Set(S.sels);
+
+  const onMove = (ev2) => {
+    const x1 = ev2.clientX - rect.left, y1 = ev2.clientY - rect.top;
+    const L = Math.min(x0, x1), T = Math.min(y0, y1);
+    const W = Math.abs(x1 - x0), H = Math.abs(y1 - y0);
+    box.style.cssText = `left:${L}px;top:${T}px;width:${W}px;height:${H}px`;
+    // 归一化后与元素盒子求交
+    const a = { x0: L / rect.width, y0: T / rect.height,
+                x1: (L + W) / rect.width, y1: (T + H) / rect.height };
+    const hits = [];
+    S.page.elements.forEach(e => {
+      const b = S.boxes[e.id];
+      if (!b) return;
+      if (b[0] < a.x1 && b[0] + b[2] > a.x0 &&
+          b[1] < a.y1 && b[1] + b[3] > a.y0) hits.push(e.id);
+    });
+    const next = new Set(ev2.shiftKey ? base : []);
+    hits.forEach(id => next.add(id));
+    setSelection(Array.from(next), hits[0] || S.sel);
+    refreshSel(); renderProps(); renderLayers();
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    box.remove();
   };
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
@@ -399,11 +533,315 @@ function startTailDrag(ev, e) {
   window.addEventListener('pointerup', onUp);
 }
 
+/* ══════════════════════════════════════════════════
+ * 裁剪（图片元素）
+ *
+ * crop 的真实语义（读 packages/editor/render.py:132-137 确认）：
+ *     crop = [l, t, r, b] —— **四边相对原图的内缩比例**，不是包围盒。
+ *     渲染时先按它把原图四周裁掉一圈，再把裁完的结果 fit 进元素盒子
+ *     （render.py:139-149）。
+ *
+ * ★ ①②两件事必须先知道，否则这个界面一定是错的：
+ *   ① 盒子**不会**因为裁剪变小 —— 盒子的高是按**原图**宽高比算的
+ *      （render.py:446），所以裁完之后保留的部分会被放大铺满原来的框。
+ *   ② fit 是在裁剪**之后**做的，于是盒子的边缘未必是原图的边缘 ——
+ *      cover 早就把两侧切掉了、contain 还留着黑边、fill 会把整张拉伸进盒子。
+ *      所以不能把「框在盒子里的比例」直接当成 crop 数值：那是「所见非所切」，
+ *      用户把框对到画面里的东西上，切掉的却是别处。
+ *      viewMap() 按渲染器同一套数学反解，保证「框住哪块，写进去就是哪块」。
+ * ══════════════════════════════════════════════════ */
+
+/** 裁剪目标元素（会话期间它可能被别处删掉，所以每次都现查） */
+function cropEl() {
+  if (!cropState || !S.page) return null;
+  return S.page.elements.find(x => x.id === cropState.eid) || null;
+}
+
+/**
+ * 复刻 render.py 的 fit 数学，得到「盒子比例 ↔ 原图比例」的互换函数
+ *
+ * @param e    图片元素
+ * @param crop 画布上**这一份渲染**所对应的裁剪（屏幕方向，flip_h 已折算）
+ * @returns {ux, vy, bx, by}；素材或盒子缺一就返回 null
+ */
+function viewMap(e, crop) {
+  const box = S.boxes[e.id];
+  const a = (S.proj.assets || []).find(x => x.id === e.asset_id);
+  if (!box || !a || !a.width || !a.height) return null;
+  const [l, t, r, b] = crop || [0, 0, 0, 0];
+  // 单位取页面像素即可 —— 这里只用得到比例
+  const pw = S.page.width || 1400, ph = S.page.height || 2000;
+  const bw = box[2] * pw, bh = box[3] * ph;
+  const aw = a.width, ah = a.height;
+  const kw = aw * (1 - l - r), kh = ah * (1 - t - b);
+  if (kw <= 1e-6 || kh <= 1e-6) return null;
+  // render.py:140-149：fill 两轴各自拉伸；cover / contain 共用一个等比系数
+  let sx, sy;
+  if (e.fit === 'fill') { sx = bw / kw; sy = bh / kh; }
+  else {
+    const s = e.fit === 'contain' ? Math.min(bw / kw, bh / kh)
+      : Math.max(bw / kw, bh / kh);
+    sx = sy = s;
+  }
+  // 缩放后居中摆放，超出盒子的部分被裁掉（render.py:148-149）
+  const dx = (bw - kw * sx) / 2, dy = (bh - kh * sy) / 2;
+  return {
+    ux: (p) => l + (p * bw - dx) / (aw * sx),   // 盒子横向比例 → 原图横向比例
+    vy: (q) => t + (q * bh - dy) / (ah * sy),
+    bx: (u) => (dx + (u - l) * aw * sx) / bw,   // 原图横向比例 → 盒子横向比例
+    by: (v) => (dy + (v - t) * ah * sy) / bh,
+  };
+}
+
+/** crop 数据 ↔ 屏幕方向
+ *
+ *  flip_h 是**裁完之后**才翻转的（render.py:151），所以数据里的 l（原图左边）
+ *  在屏幕上跑到了右边 —— 互换 l/r 就是两个方向的换算，做两次等于没做。 */
+const flipCrop = (c) => [c[2], c[1], c[0], c[3]];
+
+/** 进入裁剪模式（属性面板的「裁剪」按钮） */
+function enterCrop(e) {
+  if (!e || e.kind !== 'image') return;
+  if (cropState) {
+    if (cropState.eid === e.id) return;      // 已经在裁它了
+    exitCrop();
+  }
+  if (!S.boxes[e.id]) { toast('这张图还没渲染出来，稍等一下再裁', true); return; }
+  if (!$('.page-holder')) { toast('先选中画布上的一张图', true); return; }
+
+  // ★ 基准：画布这一份渲染对应的那份裁剪。
+  //   会话期间**不能变** —— 一变，换算就和屏幕上的像素对不上了。
+  const data = (e.crop && e.crop.length === 4) ? e.crop.slice() : [0, 0, 0, 0];
+  const ref = e.flip_h ? flipCrop(data) : data;
+  const m = viewMap(e, ref);
+  if (!m) { toast('取不到这张图的尺寸，没法裁剪', true); return; }
+
+  // 初始框 = 画面里**真正看得见**的那一块，而不是「整个盒子」：
+  //   cover 已经切掉两侧、contain 还留着黑边。
+  //   这样「什么都不动直接完成」等于画面不变，不会平白多出一个裁剪。
+  const vl = clamp(m.ux(0), ref[0], 1 - ref[2]);
+  const vr = clamp(m.ux(1), ref[0], 1 - ref[2]);
+  const vt = clamp(m.vy(0), ref[1], 1 - ref[3]);
+  const vb = clamp(m.vy(1), ref[1], 1 - ref[3]);
+  cropState = {
+    eid: e.id, ref, holder: null, frame: null, keep: null, bar: null, ro: null,
+    sl: clamp(m.bx(vl), 0, 1), st: clamp(m.by(vt), 0, 1),
+    sr: clamp(1 - m.bx(vr), 0, 1), sb: clamp(1 - m.by(vb), 0, 1),
+  };
+  buildCropBar();
+  attachCropUi();
+  if (e.rotation) toast('这张图带旋转角度，裁剪框按旋转前的原图算，画面对不上是正常的');
+  status('裁剪中：拖四条边圈出要保留的部分；Esc 取消');
+}
+
+/** 退出裁剪模式（不提交任何改动；可重复调用） */
+function exitCrop() {
+  if (!cropState) return;
+  const holder = cropState.holder || $('.page-holder');
+  if (holder) holder.classList.remove('cropping');
+  // 全局扫一遍：holder 可能已经被 drawCanvas 换掉了，别留个孤儿框在画布上
+  $$('.crop-frame').forEach(n => n.remove());
+  const bar = $('.crop-bar');
+  if (bar) bar.remove();
+  cropState = null;
+}
+
+/** 把裁剪框挂到画布上（drawCanvas 会换掉 holder，所以要能重复调用） */
+function attachCropUi() {
+  const c = cropState; if (!c) return;
+  const e = cropEl();
+  const holder = $('.page-holder');
+  const box = e ? S.boxes[e.id] : null;
+  if (!e || !holder || !box) { exitCrop(); return; }
+  const old = holder.querySelector('.crop-frame');
+  if (old) old.remove();
+
+  // 框本身 = 元素盒子；框内再摆四个遮罩（框外压暗）和四条可拖的边
+  const f = el('div', 'crop-frame');
+  f.style.cssText = `left:${box[0] * 100}%;top:${box[1] * 100}%;` +
+    `width:${box[2] * 100}%;height:${box[3] * 100}%`;
+  ['t', 'b', 'l', 'r'].forEach(k => f.appendChild(el('div', 'crop-mask ' + k)));
+  const keep = el('div', 'crop-keep');
+  const tip = { n: '上边', s: '下边', w: '左边', e: '右边' };
+  ['n', 's', 'w', 'e'].forEach(k => {
+    const hd = el('div', 'crop-edge ' + k);
+    hd.title = '拖动' + tip[k] + '（至少保留 ' + Math.round(CROP_MIN * 100) + '%）';
+    hd.onpointerdown = (ev) => startCropDrag(ev, k);
+    keep.appendChild(hd);
+  });
+  f.appendChild(keep);
+  holder.appendChild(f);
+  // ★ 裁剪中其它元素的手柄不响应点击 —— 否则一拖就变成了挪元素
+  holder.classList.add('cropping');
+  c.holder = holder; c.frame = f; c.keep = keep;
+  paintCrop();
+}
+
+/** 按 cropState 里的框位置重画遮罩/边/读数 */
+function paintCrop() {
+  const c = cropState; if (!c || !c.keep) return;
+  const L = c.sl * 100, T = c.st * 100;
+  const W = (1 - c.sl - c.sr) * 100, H = (1 - c.st - c.sb) * 100;
+  const q = (s) => c.frame.querySelector(s);
+  q('.crop-mask.t').style.cssText = `left:0;right:0;top:0;height:${T}%`;
+  q('.crop-mask.b').style.cssText = `left:0;right:0;bottom:0;height:${c.sb * 100}%`;
+  q('.crop-mask.l').style.cssText = `left:0;top:${T}%;bottom:${c.sb * 100}%;width:${L}%`;
+  q('.crop-mask.r').style.cssText = `right:0;top:${T}%;bottom:${c.sb * 100}%;width:${c.sr * 100}%`;
+  c.keep.style.cssText = `left:${L}%;top:${T}%;width:${W}%;height:${H}%`;
+  if (c.ro) c.ro.textContent = cropReadout();
+}
+
+/** 框 → crop 数据（原图四边内缩比例，0–1）
+ *
+ *  基准用 cropState.ref，也就是**画布上那份渲染**对应的裁剪：
+ *  会话开始后就固定，拖动时不会因为「框变了→比例变了→框又变了」而抖动。 */
+function cropFromFrame() {
+  const c = cropState; if (!c) return null;
+  const e = cropEl(); if (!e) return null;
+  const m = viewMap(e, c.ref); if (!m) return null;
+  const l = clamp(m.ux(c.sl), 0, 1);
+  const r = clamp(1 - m.ux(1 - c.sr), 0, 1);
+  const t = clamp(m.vy(c.st), 0, 1);
+  const b = clamp(1 - m.vy(1 - c.sb), 0, 1);
+  if (l + r >= 0.999 || t + b >= 0.999) return null;      // 太窄，服务端会忽略
+  const d = e.flip_h ? flipCrop([l, t, r, b]) : [l, t, r, b];
+  return [round(d[0]), round(d[1]), round(d[2]), round(d[3])];
+}
+
+/** 框是否还贴着盒子四条边（= 一个像素都没裁） */
+function cropFrameIsFull() {
+  const c = cropState;
+  if (!c) return false;
+  return c.sl < 1e-4 && c.st < 1e-4 && c.sr < 1e-4 && c.sb < 1e-4;
+}
+
+/** 工具条上的读数：直接写将要存进去的 crop 数值（不是屏幕上框的比例） */
+function cropReadout() {
+  if (cropFrameIsFull()) {
+    // ★ 框贴着四条边 = 一个像素都没裁。这里必须照实说：
+    //   否则「完成」明明什么都没写，读数却报个 26%，用户会以为裁了
+    return cropState.ref.every(x => Math.abs(x) < 1e-4)
+      ? '不裁剪（整张图）' : '保持原样（框没动）';
+  }
+  const v = cropFromFrame();
+  if (!v) return '（范围太小）';
+  return '左 ' + Math.round(v[0] * 100) + '% · 上 ' + Math.round(v[1] * 100) +
+    '% · 右 ' + Math.round(v[2] * 100) + '% · 下 ' + Math.round(v[3] * 100) + '%';
+}
+
+/** 改框（拖动中调用）：只动本地，不发请求 */
+function setCropFrame(n) {
+  const c = cropState; if (!c) return;
+  c.sl = n.sl; c.st = n.st; c.sr = n.sr; c.sb = n.sb;
+  paintCrop();
+}
+
+/** 拖一条边：对边固定，只让被拖的这条动，且至少留 CROP_MIN */
+function startCropDrag(ev, which) {
+  ev.preventDefault(); ev.stopPropagation();
+  const c = cropState;
+  if (!c || !c.frame) return;
+  const rect = c.frame.getBoundingClientRect();
+  const x0 = ev.clientX, y0 = ev.clientY;
+  const s0 = { sl: c.sl, st: c.st, sr: c.sr, sb: c.sb };
+
+  const onMove = (ev2) => {
+    const dx = (ev2.clientX - x0) / Math.max(1, rect.width);
+    const dy = (ev2.clientY - y0) / Math.max(1, rect.height);
+    const n = { sl: s0.sl, st: s0.st, sr: s0.sr, sb: s0.sb };
+    if (which === 'w') n.sl = clamp(s0.sl + dx, 0, 1 - s0.sr - CROP_MIN);
+    if (which === 'e') n.sr = clamp(s0.sr - dx, 0, 1 - s0.sl - CROP_MIN);
+    if (which === 'n') n.st = clamp(s0.st + dy, 0, 1 - s0.sb - CROP_MIN);
+    if (which === 's') n.sb = clamp(s0.sb - dy, 0, 1 - s0.st - CROP_MIN);
+    setCropFrame(n);
+    status('裁剪中：左 ' + Math.round(n.sl * 100) + '% · 上 ' +
+      Math.round(n.st * 100) + '% · 右 ' + Math.round(n.sr * 100) + '% · 下 ' +
+      Math.round(n.sb * 100) + '%');
+  };
+  const onUp = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    status('裁剪中：拖四条边圈出要保留的部分；Esc 取消');
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
+
+/** 完成：把框写成 crop */
+async function commitCrop() {
+  const c = cropState; if (!c) return;
+  const e = cropEl();
+  if (!e) { exitCrop(); return; }
+
+  // ★ 框贴着四条边 = 用户一个像素都没裁 → **一个请求都不发**。
+  //   为什么不写个「等价」的值回去：盒子看不全整张图（cover）是 fit 的事，
+  //   不代表用户想裁掉看不见的部分；而带着旧 crop 进来再原样写回去，
+  //   只会白白抬一次 revision，跟别的标签页更容易撞乐观并发。
+  if (cropFrameIsFull()) {
+    const wasFull = c.ref.every(x => Math.abs(x) < 1e-4);
+    exitCrop(); status('');
+    toast(wasFull ? '没有裁掉任何东西' : '裁剪没有改动');
+    return;
+  }
+
+  const v = cropFromFrame();
+  if (!v) { toast('裁剪范围太小，应用不了', true); return; }
+  const ok = await saveProps(e.id, { crop: v });
+  if (!ok) return;                    // 存不上就留在裁剪里，别把用户调好的框丢了
+  exitCrop();
+  await drawCanvas();                 // 让服务端按新 crop 重画 —— 眼见为实
+  status('');
+  toast('已应用裁剪');
+}
+
+/** 重置 = 去掉裁剪（crop: null） */
+async function resetCrop() {
+  const c = cropState; if (!c) return;
+  const e = cropEl();
+  if (!e) { exitCrop(); return; }
+  const had = !!e.crop;
+  const ok = await saveProps(e.id, { crop: null });
+  if (!ok) return;
+  exitCrop();
+  await drawCanvas();
+  status('');
+  toast(had ? '已重置裁剪，恢复整张图' : '这张图本来就没有裁剪');
+}
+
+/** 画布下方的裁剪工具条
+ *
+ *  挂到 .canvas-wrap 而不是画布里：drawCanvas 每次都会重建画布内容，
+ *  挂在里面会被清掉，而且跟着滚动会看不见。 */
+function buildCropBar() {
+  const wrap = $('.canvas-wrap');
+  if (!wrap || !cropState) return;
+  const old = $('.crop-bar');
+  if (old) old.remove();
+  const bar = el('div', 'crop-bar');
+  bar.appendChild(el('span', 'crop-ico', '✂'));
+  bar.appendChild(el('span', 'crop-name', '裁剪图片'));
+  const ro = el('span', 'crop-readout', '');
+  ro.title = 'crop = [左, 上, 右, 下]，各边相对**原图**内缩的比例（render.py:132）';
+  bar.appendChild(ro);
+  bar.appendChild(el('span', 'crop-tip',
+    '拖四条边圈出要保留的部分；完成后它会放大铺满原来的框'));
+  const mk = (t, fn, cls) => { const b = el('button', cls || '', t); b.onclick = fn; return b; };
+  const ops = el('div', 'crop-ops');
+  ops.appendChild(mk('重置', resetCrop));
+  ops.appendChild(mk('完成', commitCrop, 'primary'));
+  ops.appendChild(mk('取消', () => { exitCrop(); status('已取消裁剪'); }));
+  bar.appendChild(ops);
+  wrap.insertBefore(bar, wrap.querySelector('.canvas-status') || null);
+  cropState.bar = bar; cropState.ro = ro;
+}
+
 /** 保存元素属性（本地也同步，避免整页重载） */
 async function saveProps(eid, props) {
   try {
+    const q = S.revision != null ? `?revision=${S.revision}` : '';
     const r = await jpatch(
-      `/api/edit/projects/${S.proj.name}/elements/${eid}`, { props });
+      `/api/edit/projects/${S.proj.name}/elements/${eid}${q}`, { props });
+    if (r.revision != null) S.revision = r.revision;
     const i = S.page.elements.findIndex(x => x.id === eid);
     if (i >= 0) {
       const merged = Object.assign({}, S.page.elements[i], r.element);
@@ -411,7 +849,14 @@ async function saveProps(eid, props) {
     }
     syncProjectCache(eid, r.element);
     return true;
-  } catch (e) { toast('保存失败：' + e.message, true); return false; }
+  } catch (e) {
+    if (String(e.message).includes('已被其他人修改')) {
+      toast('这个项目在别处也被改了。刷新页面（F5）载入最新版本后再继续。', true);
+    } else {
+      toast('保存失败：' + e.message, true);
+    }
+    return false;
+  }
 }
 
 function syncProjectCache(eid, ne) {
@@ -543,6 +988,110 @@ function updatePageLabel() {
 /* ══════════════════════════════════════════════════
  * 右栏：属性
  * ══════════════════════════════════════════════════ */
+/* ── 多选与对齐（Office 式）────────────────────── */
+
+/** 把 S.sel 与 S.sels 同步：sel 必须属于 sels */
+function setSelection(ids, primary) {
+  // 裁剪中换了目标就没法画框了 —— 先把裁剪收掉（不提交）。
+  // 不放在各个调用点是因为改选的入口太多（图层面板、框选、翻页…）。
+  if (cropState && !(ids || []).includes(cropState.eid)) exitCrop();
+  S.sels = new Set(ids || []);
+  S.sel = primary || (S.sels.size ? Array.from(S.sels)[0] : null);
+  if (S.sel && !S.sels.has(S.sel)) S.sels.add(S.sel);
+}
+
+function isSelected(id) { return S.sels.has(id); }
+
+/** 当前选中的所有元素对象 */
+function selectedEls() {
+  if (!S.page) return [];
+  return S.page.elements.filter(e => S.sels.has(e.id));
+}
+
+/** 选中元素的整体包围盒（归一化） */
+function selectionBounds() {
+  const els = selectedEls().filter(e => S.boxes[e.id]);
+  if (!els.length) return null;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  els.forEach(e => {
+    const b = S.boxes[e.id];
+    x0 = Math.min(x0, b[0]); y0 = Math.min(y0, b[1]);
+    x1 = Math.max(x1, b[0] + b[2]); y1 = Math.max(y1, b[1] + b[3]);
+  });
+  return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0, n: els.length };
+}
+
+/**
+ * 吸附：把一组「移动中的位置」拉到对齐线上
+ * @returns {{dx:number, dy:number, guides:Array}}
+ */
+function snapMove(bounds, others) {
+  const cands = [];
+  // 被拖元素的左/中/右、上/中/下
+  const xs = [
+    { edge: 'left', v: bounds.x0 },
+    { edge: 'center', v: (bounds.x0 + bounds.x1) / 2 },
+    { edge: 'right', v: bounds.x1 },
+  ];
+  const ys = [
+    { edge: 'top', v: bounds.y0 },
+    { edge: 'center', v: (bounds.y0 + bounds.y1) / 2 },
+    { edge: 'bottom', v: bounds.y1 },
+  ];
+  // 目标线：画布 + 其他元素
+  const tx = SNAP_X.slice();
+  const ty = SNAP_Y.slice();
+  (others || []).forEach(b => {
+    tx.push(b[0], b[0] + b[2] / 2, b[0] + b[2]);
+    ty.push(b[1], b[1] + b[3] / 2, b[1] + b[3]);
+  });
+
+  let dx = 0, bestX = SNAP;
+  xs.forEach(c => tx.forEach(t => {
+    const d = t - c.v;
+    if (Math.abs(d) < bestX) { bestX = Math.abs(d); dx = d; }
+  }));
+  let dy = 0, bestY = SNAP;
+  ys.forEach(c => ty.forEach(t => {
+    const d = t - c.v;
+    if (Math.abs(d) < bestY) { bestY = Math.abs(d); dy = d; }
+  }));
+
+  // 记录要画的参考线（只画真正吸上的那几条）
+  const guides = [];
+  if (dx !== 0 || bestX < SNAP) {
+    const v = (bounds.x0 + dx);
+    xs.forEach(c => {
+      const t = c.v + dx;
+      if (tx.some(q => Math.abs(q - t) < 1e-6)) guides.push({ axis: 'x', pos: t });
+    });
+  }
+  if (dy !== 0 || bestY < SNAP) {
+    ys.forEach(c => {
+      const t = c.v + dy;
+      if (ty.some(q => Math.abs(q - t) < 1e-6)) guides.push({ axis: 'y', pos: t });
+    });
+  }
+  return { dx, dy, guides };
+}
+
+/** 把参考线画到画布上（只是视觉提示，不参与渲染） */
+function drawGuides(holder) {
+  holder.querySelectorAll('.guide').forEach(n => n.remove());
+  S.guides.forEach(g => {
+    const n = el('div', 'guide ' + g.axis);
+    if (g.axis === 'x') n.style.cssText = `left:${g.pos * 100}%`;
+    else n.style.cssText = `top:${g.pos * 100}%`;
+    holder.appendChild(n);
+  });
+}
+
+function clearGuides() {
+  S.guides = [];
+  const h = $('.page-holder');
+  if (h) h.querySelectorAll('.guide').forEach(n => n.remove());
+}
+
 function curEl() {
   if (!S.page || !S.sel) return null;
   return S.page.elements.find(e => e.id === S.sel) || null;
@@ -743,6 +1292,21 @@ function imageProps(e) {
   if (a) {
     g.appendChild(el('div', 'hint', `${a.filename} · ${a.width}×${a.height}`));
   }
+  // ── 裁剪入口
+  //    crop 是「相对原图四边内缩的比例」，不是包围盒（render.py:132）——
+  //    面板里把数值原样写出来，用户不用进画布就知道现在裁掉多少
+  const cbtn = el('div', 'btns');
+  const cb = el('button', '', e.crop ? '✂ 重新裁剪' : '✂ 裁剪');
+  cb.title = '在画布上拖四条边，圈出要保留的部分（Esc 取消）';
+  cb.onclick = () => enterCrop(e);
+  cbtn.appendChild(cb);
+  g.appendChild(cbtn);
+  if (e.crop && e.crop.length === 4) {
+    g.appendChild(el('div', 'hint pad', '已裁剪：左 ' +
+      Math.round(e.crop[0] * 100) + '% · 上 ' + Math.round(e.crop[1] * 100) +
+      '% · 右 ' + Math.round(e.crop[2] * 100) + '% · 下 ' +
+      Math.round(e.crop[3] * 100) + '%'));
+  }
   g.appendChild(selRow('填充方式', e.fit, [
     ['cover', '铺满（裁掉溢出）'], ['contain', '完整显示'],
     ['fill', '拉伸铺满'],
@@ -823,8 +1387,15 @@ function renderLayers() {
     ops.appendChild(mk('⧉', '复制', () => duplicateElement(e.id)));
     ops.appendChild(mk('×', '删除', () => deleteElement(e.id)));
     it.appendChild(ops);
-    it.onclick = () => {
-      S.sel = e.id; refreshSel(); renderProps(); renderLayers();
+    it.onclick = (ev) => {
+      if (ev.shiftKey) {
+        const next = new Set(S.sels);
+        if (next.has(e.id)) next.delete(e.id); else next.add(e.id);
+        setSelection(Array.from(next), e.id);
+      } else {
+        setSelection([e.id], e.id);
+      }
+      refreshSel(); renderProps(); renderLayers();
     };
     host.appendChild(it);
   });
@@ -858,15 +1429,38 @@ async function deleteElement(eid) {
   const e = S.page.elements.find(x => x.id === eid);
   if (e && e.locked) { toast('已锁定，先解锁'); return; }
   try {
-    await api(url(`/api/edit/projects/${S.proj.name}/elements/${eid}`),
+    await api(url(`/api/edit/projects/${S.proj.name}/elements/${eid}`
+      + (S.revision != null ? `?revision=${S.revision}` : '')),
       { method: 'DELETE' });
     S.page.elements = S.page.elements.filter(x => x.id !== eid);
     const p = S.proj.pages.find(x => x.id === S.page.id);
     if (p) p.elements = S.page.elements;
+    S.sels.delete(eid);
     if (S.sel === eid) S.sel = null;
     await drawCanvas();
     toast('已删除');
   } catch (err) { toast('删除失败：' + err.message, true); }
+}
+
+/** 批量删除选中的元素 */
+async function deleteSelected() {
+  const els = selectedEls();
+  if (!els.length) return;
+  const unlockable = els.filter(e => e.locked);
+  if (unlockable.length) { toast(`有 ${unlockable.length} 个已锁定，先解锁`); return; }
+  if (els.length === 1) return deleteElement(els[0].id);
+  if (!confirm(`删除选中的 ${els.length} 个元素？`)) return;
+  S.busy = true; status('删除中…');
+  try {
+    for (const e of els) {
+      await api(url(`/api/edit/projects/${S.proj.name}/elements/${e.id}`),
+        { method: 'DELETE' });
+    }
+    S.sels.clear(); S.sel = null;
+    await openProject(S.proj.name);      // 批量操作后重新拉一次，保证一致
+    toast(`已删除 ${els.length} 个`);
+  } catch (e) { toast('删除失败：' + e.message, true); }
+  finally { S.busy = false; status(''); }
 }
 
 async function duplicateElement(eid) {
@@ -1135,6 +1729,14 @@ function bind() {
 
   // 快捷键
   window.addEventListener('keydown', async (ev) => {
+    // ★ 裁剪模式下只认 Esc：其它快捷键（Del / 方向键 / Ctrl+A…）会让路，
+    //   否则一边调框一边把被裁的图删了/挪了。
+    if (cropState) {
+      if (ev.key === 'Escape') {
+        ev.preventDefault(); exitCrop(); status('已取消裁剪');
+      }
+      return;
+    }
     const tag = (ev.target.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
     const e = curEl();
@@ -1147,22 +1749,46 @@ function bind() {
       return;
     }
     if (ev.key === 'Delete' || ev.key === 'Backspace') {
-      if (e) { ev.preventDefault(); await deleteElement(e.id); }
+      if (S.sels.size) { ev.preventDefault(); await deleteSelected(); }
       return;
     }
-    if (ev.key === 'Escape') { S.sel = null; refreshSel(); renderProps(); renderLayers(); return; }
+    if (ev.key === 'Escape') {
+      setSelection([], null); clearGuides();
+      refreshSel(); renderProps(); renderLayers();
+      return;
+    }
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
+      ev.preventDefault();
+      if (S.page) {
+        setSelection(S.page.elements.map(x => x.id), null);
+        refreshSel(); renderProps(); renderLayers();
+        toast(`已全选 ${S.sels.size} 个元素`);
+      }
+      return;
+    }
     if (ev.key === 'ArrowLeft' || ev.key === 'ArrowRight' ||
         ev.key === 'ArrowUp' || ev.key === 'ArrowDown') {
-      if (!e) return;
+      const targets = selectedEls();
+      if (!targets.length) return;
       ev.preventDefault();
       const step = ev.shiftKey ? 0.02 : 0.004;
-      if (ev.key === 'ArrowLeft') e.x = round(clamp(e.x - step, -0.5, 1.5));
-      if (ev.key === 'ArrowRight') e.x = round(clamp(e.x + step, -0.5, 1.5));
-      if (ev.key === 'ArrowUp') e.y = round(clamp(e.y - step, -0.5, 1.5));
-      if (ev.key === 'ArrowDown') e.y = round(clamp(e.y + step, -0.5, 1.5));
-      const node = document.querySelector(`.ov[data-eid="${e.id}"]`);
-      if (node) { node.style.left = e.x * 100 + '%'; node.style.top = e.y * 100 + '%'; }
-      await saveProps(e.id, { x: e.x, y: e.y });
+      const dx = ev.key === 'ArrowLeft' ? -step
+        : ev.key === 'ArrowRight' ? step : 0;
+      const dy = ev.key === 'ArrowUp' ? -step
+        : ev.key === 'ArrowDown' ? step : 0;
+      targets.forEach(x => {
+        x.x = round(clamp(x.x + dx, -0.5, 1.5));
+        x.y = round(clamp(x.y + dy, -0.5, 1.5));
+        const node = document.querySelector(`.ov[data-eid="${x.id}"]`);
+        if (node) {
+          node.style.left = x.x * 100 + '%';
+          node.style.top = x.y * 100 + '%';
+        }
+      });
+      const moves = {};
+      targets.forEach(x => { moves[x.id] = { x: x.x, y: x.y }; });
+      if (targets.length === 1) await saveProps(targets[0].id, moves[targets[0].id]);
+      else await batchMove(moves);
     }
     if (ev.key === 'PageDown' || ev.key === 'PageUp') {
       const i = pageIndex(); const ps = orderedPages();
@@ -1213,3 +1839,91 @@ function bind() {
     document.body.appendChild(box);
   }
 })();
+
+/* ── 仅用于截图验证：?_demo=guides 时自动全选并显示参考线 ──
+   这是临时钩子，不影响正常使用。 */
+if (new URLSearchParams(location.search).get('_demo') === 'guides') {
+  setTimeout(() => {
+    if (!S.page) return;
+    setSelection(S.page.elements.map(x => x.id), null);
+    S.guides = [
+      { axis: 'x', pos: 0.5 },
+      { axis: 'y', pos: 0.25 },
+    ];
+    const h = document.querySelector('.page-holder');
+    if (h) drawGuides(h);
+    refreshSel(); renderProps(); renderLayers();
+    status('截图验证模式：已全选 ' + S.sels.size + ' 个元素并显示参考线');
+  }, 2500);
+}
+
+/* ── 仅用于截图验证：?_demo=crop[&apply=1] ──
+   命令行里没法点鼠标，所以这里走**真实代码路径**：
+   选中第一张图 → enterCrop() → 向四条边派发真的 pointer 事件 →
+   （apply=1 时再按「完成」，用来验证服务端真的按新 crop 重画了）。
+   同时把框位置 / 算出的 crop 写进隐藏的 #cropDbg，方便 --dump-dom 取数核对。
+   临时钩子，不影响正常使用。 */
+if (new URLSearchParams(location.search).get('_demo') === 'crop') {
+  const q = new URLSearchParams(location.search);
+  setTimeout(async () => {
+    const found = S.page && S.page.elements.find(x => x.kind === 'image');
+    if (!found) { toast('演示：这一页没有图片元素', true); return; }
+    // flip=1：先打开水平翻转，用来验证「裁剪数据 ↔ 屏幕左右」的换算
+    if (q.get('flip') === '1') {
+      await saveProps(found.id, { flip_h: true });
+      await drawCanvas();
+    }
+    const img = S.page.elements.find(x => x.id === found.id);
+    setSelection([img.id], img.id);
+    renderProps(); renderLayers(); refreshSel();
+    enterCrop(img);
+    const holder = document.querySelector('.page-holder');
+    const f = holder && holder.querySelector('.crop-frame');
+    if (!cropState || !f) { toast('演示：没能进入裁剪模式', true); return; }
+    // 画布的宽度是图片 onload 后 applyZoom 才定的；没宽度的话下面的拖动全是 0 位移
+    for (let i = 0; i < 40 && !(f.getBoundingClientRect().width > 10); i++) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    const drag = (k, dx, dy) => {
+      const hd = f.querySelector('.crop-edge.' + k);
+      if (!hd) return;
+      const r = hd.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      const mk = (t, x, y) => new PointerEvent(t,
+        { clientX: x, clientY: y, bubbles: true, cancelable: true });
+      hd.dispatchEvent(mk('pointerdown', cx, cy));
+      window.dispatchEvent(mk('pointermove', cx + dx, cy + dy));
+      window.dispatchEvent(mk('pointerup', cx + dx, cy + dy));
+    };
+    const r0 = f.getBoundingClientRect();
+    drag('w', r0.width * 0.20, 0);
+    drag('n', 0, r0.height * 0.10);
+    drag('e', -r0.width * 0.15, 0);
+    drag('s', 0, -r0.height * 0.12);
+
+    const a = (S.proj.assets || []).find(x => x.id === img.asset_id) || {};
+    const hr = holder.getBoundingClientRect(), fr = f.getBoundingClientRect();
+    const dbg = document.createElement('pre');
+    dbg.id = 'cropDbg';
+    dbg.hidden = true;
+    dbg.textContent = JSON.stringify({
+      box: S.boxes[img.id], asset: [a.width, a.height], fit: img.fit,
+      page: [S.page.width, S.page.height], ref: cropState.ref,
+      flip: !!img.flip_h,
+      frame: [cropState.sl, cropState.st, cropState.sr, cropState.sb],
+      crop: cropFromFrame(),
+      // 屏幕上的实际矩形（给截图核对用）
+      holderRect: [hr.left, hr.top, hr.width, hr.height],
+      frameRect: [fr.left, fr.top, fr.width, fr.height],
+    });
+    document.body.appendChild(dbg);
+    // 状态栏保持和真实操作一致（截图要能直接当文档图用），数值看工具条读数
+    status('裁剪中：拖四条边圈出要保留的部分；Esc 取消');
+    if (q.get('apply') === '1') {
+      await commitCrop();
+      await new Promise(r => setTimeout(r, 1500));
+      toast('演示：已应用裁剪');
+    }
+  }, 2500);
+}

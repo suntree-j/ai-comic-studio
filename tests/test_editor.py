@@ -250,18 +250,24 @@ def test_image_box_height_matches_aspect(project):
     """★ 回归：图片包围盒高度按原图比例算
 
     最初把「像素宽」当成「比例高」返回，前端选择框比实际图片高一大截。
+
+    ★ 容差按「1 像素」折算：包围盒现在是**量最终贴上去的那块图**的尺寸
+      （`_render_image_piece`），像素取整会带来最多 1px 的偏差：
+        1px / 1400画布宽 ... 换算到归一化高 ≈ 1/2000 = 0.0005
+      所以用 0.001 而不是 1e-6。这个取舍是刻意的 ——
+      宁可差半像素，也不要为了数学上的整齐而让选择框和画面对不上。
     """
     _, a, pg = project
     el = ImageElement(asset_id=a.id, x=0, y=0, w=1.0)
     img = _img(1600, 1100)
     h = _image_box_h(el, img, (pg.width, pg.height))
     expect = 1.0 * (1400 / 2000) * (1100 / 1600)
-    assert abs(h - expect) < 1e-6, f"得到 {h:.4f}，期望 {expect:.4f}"
+    assert abs(h - expect) < 0.001, f"得到 {h:.4f}，期望 {expect:.4f}"
 
     # 与渲染结果一致
     pg.elements.append(el)
     _, boxes = render_page(pg, lambda i: img, 800, with_boxes=True)
-    assert abs(boxes[el.id][3] - expect) < 0.005
+    assert abs(boxes[el.id][3] - h) < 1e-9, "盒子必须来自同一处计算"
 
 
 def test_image_box_height_respects_explicit_h(project):

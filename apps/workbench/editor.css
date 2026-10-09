@@ -195,3 +195,60 @@ button.danger:hover{background:#3a1c1c;border-color:var(--err)}
   border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;
   vertical-align:-1px;margin-right:5px}
 @keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── 对齐参考线（拖动时出现）───────────────────── */
+.guide{position:absolute;z-index:6;pointer-events:none;
+  background:#ff2d95;box-shadow:0 0 4px #ff2d9588}
+.guide.x{top:0;bottom:0;width:1px;transform:translateX(-0.5px)}
+.guide.y{left:0;right:0;height:1px;transform:translateY(-0.5px)}
+
+/* ── 框选矩形 ─────────────────────────────────── */
+.marquee{position:absolute;z-index:5;pointer-events:none;
+  border:1px solid #4a9eff;background:#4a9eff22;border-radius:2px}
+
+/* ── 裁剪模式（图片）─────────────────────────────
+   服务端的 crop 是「相对原图四边内缩」，所以这里画的框 = 保留范围：
+   框外压暗、框内保持原样。框的位置由 editor.js 的 viewMap() 按渲染器
+   同一套 fit 数学反算，保证「框住哪块，切下来就是哪块」。 */
+.page-holder.cropping .ov{pointer-events:none}
+/* 元素自己的缩放手柄/箭头点在裁剪时也藏掉 —— 留着像是能拖，其实已经点不动了 */
+.page-holder.cropping .ov .handle,
+.page-holder.cropping .tail-dot{display:none}
+.page-holder.cropping .guide{display:none}
+.crop-frame{position:absolute;z-index:8}
+.crop-mask{position:absolute;background:#0b0e13d9;pointer-events:none}
+.crop-keep{position:absolute;border:1.5px solid var(--accent);
+  box-shadow:0 0 0 1px #00000066 inset}
+.crop-edge{position:absolute}
+.crop-edge.n,.crop-edge.s{left:0;right:0;height:16px;cursor:ns-resize}
+.crop-edge.n{top:-8px}
+.crop-edge.s{bottom:-8px}
+.crop-edge.w,.crop-edge.e{top:0;bottom:0;width:16px;cursor:ew-resize}
+.crop-edge.w{left:-8px}
+.crop-edge.e{right:-8px}
+.crop-edge::after{content:'';position:absolute;background:var(--accent);
+  border-radius:2px;box-shadow:0 0 5px #000a}
+.crop-edge.n::after,.crop-edge.s::after{left:50%;margin-left:-14px;width:28px;height:4px}
+.crop-edge.n::after{top:6px}
+.crop-edge.s::after{bottom:6px}
+.crop-edge.w::after,.crop-edge.e::after{top:50%;margin-top:-14px;height:28px;width:4px}
+.crop-edge.w::after{left:6px}
+.crop-edge.e::after{right:6px}
+.crop-edge:hover::after{background:#8cc8ff}
+
+/* 画布下方的裁剪工具条（常驻在画布里，重绘画布也不会被清掉） */
+.crop-bar{flex:0 0 auto;display:flex;align-items:center;gap:10px;
+  padding:7px 12px;background:#1b2733;border-top:1px solid var(--line);
+  font-size:12.5px}
+.crop-ico{color:var(--accent)}
+.crop-name{color:var(--fg);font-weight:600;white-space:nowrap}
+.crop-readout{color:var(--accent);white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.crop-tip{flex:1;min-width:0;color:var(--fg3);font-size:11.5px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.crop-ops{display:flex;gap:6px;flex:0 0 auto}
+.crop-ops button{font-size:12px;padding:5px 12px}
+
+/* ── 多选时的额外提示 ─────────────────────────── */
+.ov.sel::after{content:'';position:absolute;inset:-3px;border-radius:3px;
+  box-shadow:0 0 0 1px #4a9eff66;pointer-events:none}
