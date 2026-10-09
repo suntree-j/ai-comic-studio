@@ -172,11 +172,35 @@ def push_env_file() -> None:
         return
 
     body = "\n".join(f"{k}={v}" for k, v in sorted(vals.items()))
-    # 原子写 + 只给 root 读（密钥别让别的用户 / 进程读走）
-    sh(f"umask 077 && cat > {REMOTE_DIR}/.env <<'ENVEOF'\n{body}\nENVEOF")
-    sh(f"chmod 600 {REMOTE_DIR}/.env")
+    # ★ 两个坑，都是实测踩出来的：
+    #   ① `umask 077 && cat > f <<EOF` —— umask 对 shell 重定向不生效，
+    #      落成 -rw-r--r--，密钥谁都能读。所以先 install 建一个 600 的空文件。
+    #   ② heredoc 的终结符 **必须顶格**。写成缩进的 `      ENVEOF`
+    #      （因为这段代码在 Python 里是缩进的）bash 认不出来，
+    #      会把后面的命令**全当成文件内容**写进去 ——
+    #      而且 `<<'ENVEOF'` 是不展开变量的，最后 systemd 只看到一堆垃圾。
+    #      实测症状：.env 里只有 1 行、权限 644，而配置看起来「成功」了。
+    sh(f"install -m 600 /dev/null {REMOTE_DIR}/.env")
+    sh(f"cat > {REMOTE_DIR}/.env <<'ENVEOF'\n{body}\nENVEOF")
+    r = sh(f"stat -c '%a' {REMOTE_DIR}/.env", check=False)
+    mode = (r.stdout or "").strip()
+    # ★ 校验「文件里真的有这些键」而不是数行数。
+    #   踩的坑：`wc -l` 数的是换行符个数，文件末尾没换行时会少 1，
+    #   于是「1 行」看起来像写坏了，其实内容完全正确。
+    #   现在直接问「每个键都在不在」。
+    missing = []
+    for k in sorted(vals):
+        rr = sh(f"grep -c '^{k}=' {REMOTE_DIR}/.env", check=False)
+        if (rr.stdout or "").strip() != "1":
+            missing.append(k)
     names = ", ".join(sorted(vals))
-    print(f"   已写入 .env（权限 600）：{names}")
+    print(f"   已写入 .env（权限 {mode}）：{names}")
+    if mode != "600":
+        print(f"   ⚠️ 权限是 {mode} 而不是 600，密钥可能被其他用户读到")
+    if missing:
+        print(f"   ❌ .env 里缺这些键：{missing} —— heredoc 可能没正确结束")
+    else:
+        print(f"   ✅ {len(vals)} 个键都在")
     if "COMIC_IMAGE_PROVIDER" not in vals:
         print("   ⚠️ 没设 COMIC_IMAGE_PROVIDER —— 线上仍是 mock（不会真出图）。")
         print("      要开真出图：在 .env 里加 COMIC_IMAGE_PROVIDER=siliconflow")
