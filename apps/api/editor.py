@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import io
+from contextlib import contextmanager
 import json
 import os
 import time
@@ -42,10 +43,6 @@ WORKSPACE = os.environ.get(
         os.path.abspath(__file__)))), "works"))
 
 store = EditStore(WORKSPACE)
-
-#: 撤销栈：项目名 → [project.json 快照]
-_undo: Dict[str, List[str]] = {}
-_MAX_UNDO = 40
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -79,14 +76,47 @@ def _asset_loader(project: EditProject):
 
 
 def snapshot(name: str) -> None:
-    """把当前 project.json 压进撤销栈（在修改前调用）"""
-    fp = os.path.join(store.dir_of(name), "project.json")
-    if not os.path.isfile(fp):
-        return
-    raw = open(fp, encoding="utf-8").read()
-    stack = _undo.setdefault(name, [])
-    stack.append(raw)
-    del stack[:-_MAX_UNDO]
+    """修改前存一份撤销快照
+
+    ★ 快照**落盘**（`.history/`），不再放内存 dict ——
+      原来重启服务撤销历史就全没了。
+    """
+    store.push_history(name)
+
+
+@contextmanager
+def mutate(name: str, revision: Optional[int] = None
+           ) -> Iterator[EditProject]:
+    """「读 → 改 → 写」全程持锁的上下文
+
+    ★ 为什么需要锁：
+      原来是「读整个 JSON → 改 → 整个写回」，没有任何保护。
+      实测 6 个并发 PATCH 有 5 个直接报文件占用错误；
+      而「先读后写」还会丢改动（后写覆盖先写）。
+
+    ★ 乐观并发控制：
+      客户端可以带上它看到的 `revision`。如果服务端的对不上，
+      说明别人先改了 —— 直接 409，让前端提示刷新，
+      而不是让后写的静默覆盖先写的。
+
+    用法：
+        with mutate("我的项目", expect_revision) as p:
+            pg = _page(p, page_id)
+            pg.elements.append(el)
+        # 退出时自动 save
+    """
+    with store.locked(name):
+        p = store.load(name)
+        if p is None:
+            raise HTTPException(404, f"项目 {name} 不存在")
+        if revision is not None and revision != p.revision:
+            raise HTTPException(
+                409,
+                f"项目已被其他人修改（服务端 revision={p.revision}，"
+                f"你提交的是 {revision}）。请刷新后重试。")
+        snapshot(name)
+        yield p
+        store.save(p)
 
 
 def _find_page_of(project: EditProject, element_id: str) -> Page:
@@ -139,20 +169,18 @@ class PatchReq(BaseModel):
 
 
 @router.patch("/projects/{name}")
-def patch_project(name: str, req: PatchReq):
-    p = _load(name)
-    snapshot(name)
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(p, k, v)
-    store.save(p)
+def patch_project(name: str, req: PatchReq, revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        for k, v in req.model_dump(exclude_none=True).items():
+            setattr(p, k, v)
     return {"ok": True, "project": p.model_dump(mode="json")}
 
 
 @router.delete("/projects/{name}")
 def delete_project(name: str):
+    # store.delete 会一并删掉 .history/ 与内存里的锁
     if not store.delete(name):
         raise HTTPException(404, "项目不存在")
-    _undo.pop(name, None)
     return {"ok": True}
 
 
@@ -161,24 +189,32 @@ def delete_project(name: str):
 # ══════════════════════════════════════════════════════════════════
 
 @router.post("/projects/{name}/assets")
-async def upload_assets(name: str, files: List[UploadFile] = File(...)):
-    """批量上传图片（支持多选 / 拖入）"""
-    p = _load(name)
+async def upload_assets(name: str, files: List[UploadFile] = File(...),
+                        revision: Optional[int] = None):
+    """批量上传图片（支持多选 / 拖入）
+
+    ★ 全程持锁：上传与「改元素」是两类并发写，
+      不锁的话上传完成时的 save 会把期间的编辑覆盖掉。
+    ★ 大小限制在 store.add_asset 里（应用层也要挡，
+      不能只靠 nginx 的 client_max_body_size）。
+    """
     added, failed = [], []
-    for f in files:
-        try:
-            data = await f.read()
-            if not data:
-                failed.append({"filename": f.filename, "error": "空文件"})
-                continue
-            a = store.add_asset(name, f.filename or "unnamed", data)
-            p.assets.append(a)
-            added.append(a)
-        except Exception as e:                              # noqa: BLE001
-            failed.append({"filename": f.filename, "reason": str(e)[:120]})
-    store.save(p)
+    with mutate(name, revision) as p:
+        for f in files:
+            try:
+                data = await f.read()
+                if not data:
+                    failed.append({"filename": f.filename, "reason": "空文件"})
+                    continue
+                a = store.add_asset(name, f.filename or "unnamed", data)
+                p.assets.append(a)
+                added.append(a)
+            except Exception as e:                          # noqa: BLE001
+                failed.append({"filename": f.filename,
+                               "reason": str(e)[:160]})
     return {"ok": True, "added": [a.model_dump(mode="json") for a in added],
-            "failed": failed, "total": len(p.assets)}
+            "failed": failed, "total": len(p.assets),
+            "revision": p.revision}
 
 
 @router.get("/projects/{name}/assets/{asset_id}/raw")
@@ -200,22 +236,22 @@ def asset_raw(name: str, asset_id: str, w: int = 0):
 
 
 @router.delete("/projects/{name}/assets/{asset_id}")
-def delete_asset(name: str, asset_id: str):
-    p = _load(name)
-    a = p.asset(asset_id)
-    if a is None:
-        raise HTTPException(404, "素材不存在")
-    used = [e.id for pg in p.pages for e in pg.elements
-            if isinstance(e, ImageElement) and e.asset_id == asset_id]
-    if used:
-        raise HTTPException(409, f"该素材正在被 {len(used)} 个元素使用，先删元素")
-    snapshot(name)
-    fp = store.asset_path(name, a.stored_name)
-    if os.path.isfile(fp):
-        os.remove(fp)
-    p.assets = [x for x in p.assets if x.id != asset_id]
-    store.save(p)
-    return {"ok": True}
+def delete_asset(name: str, asset_id: str,
+                 revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        a = p.asset(asset_id)
+        if a is None:
+            raise HTTPException(404, "素材不存在")
+        used = [e.id for pg in p.pages for e in pg.elements
+                if isinstance(e, ImageElement) and e.asset_id == asset_id]
+        if used:
+            raise HTTPException(
+                409, f"该素材正在被 {len(used)} 个元素使用，先删元素")
+        fp = store.asset_path(name, a.stored_name)
+        if os.path.isfile(fp):
+            os.remove(fp)
+        p.assets = [x for x in p.assets if x.id != asset_id]
+    return {"ok": True, "revision": p.revision}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -231,58 +267,55 @@ class PageReq(BaseModel):
 
 
 @router.post("/projects/{name}/pages")
-def add_page(name: str, req: PageReq):
-    p = _load(name)
-    snapshot(name)
-    n = p.next_number()
-    pg = Page(number=n, order=len(p.pages), title=req.title or f"第 {n} 页",
-              width=req.width or p.canvas_width,
-              height=req.height or p.canvas_height,
-              background=req.background or "#ffffff", note=req.note or "")
-    p.pages.append(pg)
-    store.save(p)
-    return {"ok": True, "page": pg.model_dump(mode="json")}
+def add_page(name: str, req: PageReq, revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        n = p.next_number()
+        pg = Page(number=n, order=len(p.pages),
+                  title=req.title or f"第 {n} 页",
+                  width=req.width or p.canvas_width,
+                  height=req.height or p.canvas_height,
+                  background=req.background or "#ffffff", note=req.note or "")
+        p.pages.append(pg)
+    return {"ok": True, "page": pg.model_dump(mode="json"),
+            "revision": p.revision}
 
 
 @router.patch("/projects/{name}/pages/{page_id}")
-def patch_page(name: str, page_id: str, req: PageReq):
-    p = _load(name)
-    pg = _page(p, page_id)
-    snapshot(name)
-    for k, v in req.model_dump(exclude_none=True).items():
-        setattr(pg, k, v)
-    store.save(p)
-    return {"ok": True, "page": pg.model_dump(mode="json")}
+def patch_page(name: str, page_id: str, req: PageReq,
+               revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        pg = _page(p, page_id)
+        for k, v in req.model_dump(exclude_none=True).items():
+            setattr(pg, k, v)
+    return {"ok": True, "page": pg.model_dump(mode="json"),
+            "revision": p.revision}
 
 
 @router.delete("/projects/{name}/pages/{page_id}")
-def delete_page(name: str, page_id: str):
-    p = _load(name)
-    _page(p, page_id)
-    snapshot(name)
-    p.pages = [x for x in p.pages if x.id != page_id]
-    for i, x in enumerate(p.ordered_pages()):
-        x.order = i
-    store.save(p)
-    return {"ok": True, "pages": len(p.pages)}
+def delete_page(name: str, page_id: str, revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        _page(p, page_id)
+        p.pages = [x for x in p.pages if x.id != page_id]
+        for i, x in enumerate(p.ordered_pages()):
+            x.order = i
+    return {"ok": True, "pages": len(p.pages), "revision": p.revision}
 
 
 @router.post("/projects/{name}/pages/{page_id}/duplicate")
-def duplicate_page(name: str, page_id: str):
-    p = _load(name)
-    src = _page(p, page_id)
-    snapshot(name)
-    n = p.next_number()
-    new = src.model_copy(deep=True)
-    new.id = new_id()                                    # 新 id
-    new.number = n
-    new.order = len(p.pages)
-    new.title = f"{src.title} 副本"
-    for e in new.elements:                               # 元素也要新 id
-        e.id = e.__class__().id
-    p.pages.append(new)
-    store.save(p)
-    return {"ok": True, "page": new.model_dump(mode="json")}
+def duplicate_page(name: str, page_id: str, revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        src = _page(p, page_id)
+        n = p.next_number()
+        new = src.model_copy(deep=True)
+        new.id = new_id()                                # 新 id
+        new.number = n
+        new.order = len(p.pages)
+        new.title = f"{src.title} 副本"
+        for e in new.elements:                           # 元素也要新 id
+            e.id = new_id()
+        p.pages.append(new)
+    return {"ok": True, "page": new.model_dump(mode="json"),
+            "revision": p.revision}
 
 
 class ReorderReq(BaseModel):
@@ -291,36 +324,36 @@ class ReorderReq(BaseModel):
 
 
 @router.post("/projects/{name}/pages/reorder")
-def reorder_pages(name: str, req: ReorderReq):
-    p = _load(name)
-    ids = {x.id for x in p.pages}
-    if set(req.page_ids) != ids:
-        raise HTTPException(400, "页面 id 列表与项目不一致（数量或内容对不上）")
-    snapshot(name)
-    pos = {pid: i for i, pid in enumerate(req.page_ids)}
-    for pg in p.pages:
-        pg.order = pos[pg.id]
-    store.save(p)
-    return {"ok": True, "order": [x.id for x in p.ordered_pages()]}
+def reorder_pages(name: str, req: ReorderReq,
+                  revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        ids = {x.id for x in p.pages}
+        if set(req.page_ids) != ids:
+            raise HTTPException(400,
+                                "页面 id 列表与项目不一致（数量或内容对不上）")
+        pos = {pid: i for i, pid in enumerate(req.page_ids)}
+        for pg in p.pages:
+            pg.order = pos[pg.id]
+    return {"ok": True, "order": [x.id for x in p.ordered_pages()],
+            "revision": p.revision}
 
 
 @router.post("/projects/{name}/pages/{page_id}/move")
-def move_page(name: str, page_id: str, delta: int = Query(...)):
+def move_page(name: str, page_id: str, delta: int = Query(...),
+              revision: Optional[int] = None):
     """上移/下移一页（delta = -1 / +1）"""
-    p = _load(name)
-    ordered = p.ordered_pages()
-    idx = next((i for i, x in enumerate(ordered) if x.id == page_id), None)
-    if idx is None:
-        raise HTTPException(404, "页面不存在")
-    j = max(0, min(len(ordered) - 1, idx + delta))
-    if j == idx:
-        return {"ok": True, "moved": 0}
-    snapshot(name)
-    ordered.insert(j, ordered.pop(idx))
-    for i, x in enumerate(ordered):
-        x.order = i
-    store.save(p)
-    return {"ok": True, "moved": j - idx}
+    with mutate(name, revision) as p:
+        ordered = p.ordered_pages()
+        idx = next((i for i, x in enumerate(ordered) if x.id == page_id), None)
+        if idx is None:
+            raise HTTPException(404, "页面不存在")
+        j = max(0, min(len(ordered) - 1, idx + delta))
+        if j == idx:
+            return {"ok": True, "moved": 0, "revision": p.revision}
+        ordered.insert(j, ordered.pop(idx))
+        for i, x in enumerate(ordered):
+            x.order = i
+    return {"ok": True, "moved": j - idx, "revision": p.revision}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -341,62 +374,64 @@ class AddElementReq(BaseModel):
 
 
 @router.post("/projects/{name}/pages/{page_id}/elements")
-def add_element(name: str, page_id: str, req: AddElementReq):
-    p = _load(name)
-    pg = _page(p, page_id)
-    snapshot(name)
+def add_element(name: str, page_id: str, req: AddElementReq,
+                revision: Optional[int] = None):
+    # 自动找空位要读素材图，放在锁里做（保证与最终落盘的一致）
+    with mutate(name, revision) as p:
+        pg = _page(p, page_id)
+        pg_id = pg.id
 
-    z = (max((e.z for e in pg.elements), default=-1)) + 1
-    # ★ 必须显式带上 kind：虽然子类有默认值，但从 dict 构造时
-    #   kind 是 Literal 判别字段，缺了会报「未知的元素类型：None」
-    base: Dict[str, Any] = {"kind": req.kind, "z": z}
+        z = (max((e.z for e in pg.elements), default=-1)) + 1
+        # ★ 必须显式带上 kind：虽然子类有默认值，但从 dict 构造时
+        #   kind 是 Literal 判别字段，缺了会报「未知的元素类型：None」
+        base: Dict[str, Any] = {"kind": req.kind, "z": z}
 
-    if req.kind == "image":
-        a = p.asset(req.asset_id or "")
-        if a is None:
-            raise HTTPException(400, "需要有效的 asset_id")
-        w = req.w if req.w else 0.6
-        base.update(asset_id=a.id, w=w,
-                    h=(req.h if req.h else round(w * pg.width / pg.height
-                                                 * a.height / max(1, a.width), 5)),
-                    x=(req.x if req.x is not None else 0.06),
-                    y=(req.y if req.y is not None else 0.06),
-                    name=a.filename[:28])
-    elif req.kind == "bubble":
-        x, y = req.x, req.y
-        if req.auto_place or x is None or y is None:
-            from packages.editor import auto_place_bubble
-            ax, ay = auto_place_bubble(pg, _asset_loader(p))
-            x = x if x is not None else ax
-            y = y if y is not None else ay
-        base.update(text=req.text or "在这里输入台词",
-                    speaker=req.speaker or "",
-                    x=x or 0.06, y=y or 0.06,
-                    w=req.w or 0.34,
-                    font_size=p.default_font_size)
-    elif req.kind == "text":
-        base.update(text=req.text or "标题",
-                    x=(req.x if req.x is not None else 0.1),
-                    y=(req.y if req.y is not None else 0.1),
-                    w=req.w or 0.5)
-    elif req.kind == "shape":
-        base.update(x=(req.x if req.x is not None else 0.1),
-                    y=(req.y if req.y is not None else 0.1),
-                    w=req.w or 0.3, h=req.h or 0.08)
-    else:
-        raise HTTPException(400, f"未知元素类型：{req.kind}")
+        if req.kind == "image":
+            a = p.asset(req.asset_id or "")
+            if a is None:
+                raise HTTPException(400, "需要有效的 asset_id")
+            w = req.w if req.w else 0.6
+            base.update(
+                asset_id=a.id, w=w,
+                h=(req.h if req.h else round(
+                    w * pg.width / pg.height * a.height / max(1, a.width), 5)),
+                x=(req.x if req.x is not None else 0.06),
+                y=(req.y if req.y is not None else 0.06),
+                name=a.filename[:28])
+        elif req.kind == "bubble":
+            x, y = req.x, req.y
+            if req.auto_place or x is None or y is None:
+                from packages.editor import auto_place_bubble
+                ax, ay = auto_place_bubble(pg, _asset_loader(p))
+                x = x if x is not None else ax
+                y = y if y is not None else ay
+            base.update(text=req.text or "在这里输入台词",
+                        speaker=req.speaker or "",
+                        x=x or 0.06, y=y or 0.06,
+                        w=req.w or 0.34,
+                        font_size=p.default_font_size)
+        elif req.kind == "text":
+            base.update(text=req.text or "标题",
+                        x=(req.x if req.x is not None else 0.1),
+                        y=(req.y if req.y is not None else 0.1),
+                        w=req.w or 0.5)
+        elif req.kind == "shape":
+            base.update(x=(req.x if req.x is not None else 0.1),
+                        y=(req.y if req.y is not None else 0.1),
+                        w=req.w or 0.3, h=req.h or 0.08)
+        else:
+            raise HTTPException(400, f"未知元素类型：{req.kind}")
 
-    base.update({k: v for k, v in req.props.items() if v is not None})
-    try:
-        el = parse_element(base)
-    except Exception as e:                                  # noqa: BLE001
-        raise HTTPException(400, f"元素参数不合法：{e}") from e
+        base.update({k: v for k, v in req.props.items() if v is not None})
+        try:
+            el = parse_element(base)
+        except Exception as e:                              # noqa: BLE001
+            raise HTTPException(400, f"元素参数不合法：{e}") from e
 
-    pg.elements.append(el)
-    pg.normalize_z()
-    store.save(p)
+        pg.elements.append(el)
+        pg.normalize_z()
     return {"ok": True, "element": el.model_dump(mode="json"),
-            "page_id": pg.id}
+            "page_id": pg_id, "revision": p.revision}
 
 
 class PatchElementReq(BaseModel):
@@ -405,53 +440,50 @@ class PatchElementReq(BaseModel):
 
 
 @router.patch("/projects/{name}/elements/{element_id}")
-def patch_element(name: str, element_id: str, req: PatchElementReq):
-    p = _load(name)
-    pg = _find_page_of(p, element_id)
-    el = next(e for e in pg.elements if e.id == element_id)
-
-    data = el.model_dump(mode="json")
-    for k, v in req.props.items():
-        if k in ("id", "kind"):
-            continue
-        data[k] = v
-    try:
-        new = parse_element(data)
-    except Exception as e:                                  # noqa: BLE001
-        raise HTTPException(400, f"参数不合法：{e}") from e
-
-    snapshot(name)
-    pg.elements = [new if e.id == element_id else e for e in pg.elements]
-    store.save(p)
-    return {"ok": True, "element": new.model_dump(mode="json")}
+def patch_element(name: str, element_id: str, req: PatchElementReq,
+                  revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        pg = _find_page_of(p, element_id)
+        el = next(e for e in pg.elements if e.id == element_id)
+        data = el.model_dump(mode="json")
+        for k, v in req.props.items():
+            if k in ("id", "kind"):
+                continue
+            data[k] = v
+        try:
+            new = parse_element(data)
+        except Exception as e:                              # noqa: BLE001
+            raise HTTPException(400, f"参数不合法：{e}") from e
+        pg.elements = [new if e.id == element_id else e for e in pg.elements]
+    return {"ok": True, "element": new.model_dump(mode="json"),
+            "revision": p.revision}
 
 
 @router.delete("/projects/{name}/elements/{element_id}")
-def delete_element(name: str, element_id: str):
-    p = _load(name)
-    pg = _find_page_of(p, element_id)
-    snapshot(name)
-    pg.elements = [e for e in pg.elements if e.id != element_id]
-    pg.normalize_z()
-    store.save(p)
-    return {"ok": True}
+def delete_element(name: str, element_id: str,
+                   revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        pg = _find_page_of(p, element_id)
+        pg.elements = [e for e in pg.elements if e.id != element_id]
+        pg.normalize_z()
+    return {"ok": True, "revision": p.revision}
 
 
 @router.post("/projects/{name}/elements/{element_id}/duplicate")
-def duplicate_element(name: str, element_id: str):
-    p = _load(name)
-    pg = _find_page_of(p, element_id)
-    src = next(e for e in pg.elements if e.id == element_id)
-    snapshot(name)
-    new = src.model_copy(deep=True)
-    new.id = new_id()
-    new.x = round(min(0.95, new.x + 0.03), 5)
-    new.y = round(min(0.95, new.y + 0.03), 5)
-    new.z = max((e.z for e in pg.elements), default=-1) + 1
-    pg.elements.append(new)
-    pg.normalize_z()
-    store.save(p)
-    return {"ok": True, "element": new.model_dump(mode="json")}
+def duplicate_element(name: str, element_id: str,
+                      revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        pg = _find_page_of(p, element_id)
+        src = next(e for e in pg.elements if e.id == element_id)
+        new = src.model_copy(deep=True)
+        new.id = new_id()
+        new.x = round(min(0.95, new.x + 0.03), 5)
+        new.y = round(min(0.95, new.y + 0.03), 5)
+        new.z = max((e.z for e in pg.elements), default=-1) + 1
+        pg.elements.append(new)
+        pg.normalize_z()
+    return {"ok": True, "element": new.model_dump(mode="json"),
+            "revision": p.revision}
 
 
 class OrderReq(BaseModel):
@@ -460,23 +492,23 @@ class OrderReq(BaseModel):
 
 
 @router.post("/projects/{name}/elements/order")
-def reorder_elements(name: str, req: OrderReq):
-    p = _load(name)
-    # 这些 id 必须都属于同一页
-    pages = [pg for pg in p.pages
-             if any(e.id in set(req.element_ids) for e in pg.elements)]
-    if len(pages) != 1:
-        raise HTTPException(400, "元素顺序只能在同一页内调整")
-    pg = pages[0]
-    if set(req.element_ids) != {e.id for e in pg.elements}:
-        raise HTTPException(400, "元素 id 列表与该页不一致")
-    snapshot(name)
-    pos = {eid: i for i, eid in enumerate(req.element_ids)}
-    for e in pg.elements:
-        e.z = pos[e.id]
-    pg.normalize_z()
-    store.save(p)
-    return {"ok": True, "order": [e.id for e in pg.sorted_elements()]}
+def reorder_elements(name: str, req: OrderReq,
+                     revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        # 这些 id 必须都属于同一页
+        pages = [pg for pg in p.pages
+                 if any(e.id in set(req.element_ids) for e in pg.elements)]
+        if len(pages) != 1:
+            raise HTTPException(400, "元素顺序只能在同一页内调整")
+        pg = pages[0]
+        if set(req.element_ids) != {e.id for e in pg.elements}:
+            raise HTTPException(400, "元素 id 列表与该页不一致")
+        pos = {eid: i for i, eid in enumerate(req.element_ids)}
+        for e in pg.elements:
+            e.z = pos[e.id]
+        pg.normalize_z()
+    return {"ok": True, "order": [e.id for e in pg.sorted_elements()],
+            "revision": p.revision}
 
 
 class BatchMoveReq(BaseModel):
@@ -485,21 +517,20 @@ class BatchMoveReq(BaseModel):
 
 
 @router.post("/projects/{name}/elements/batch-move")
-def batch_move(name: str, req: BatchMoveReq):
-    p = _load(name)
-    snapshot(name)
-    n = 0
-    for eid, xy in req.moves.items():
-        pg = _find_page_of(p, eid)
-        for e in pg.elements:
-            if e.id == eid:
-                if "x" in xy:
-                    e.x = round(max(-0.5, min(1.5, xy["x"])), 5)
-                if "y" in xy:
-                    e.y = round(max(-0.5, min(1.5, xy["y"])), 5)
-                n += 1
-    store.save(p)
-    return {"ok": True, "moved": n}
+def batch_move(name: str, req: BatchMoveReq,
+               revision: Optional[int] = None):
+    with mutate(name, revision) as p:
+        n = 0
+        for eid, xy in req.moves.items():
+            pg = _find_page_of(p, eid)
+            for e in pg.elements:
+                if e.id == eid:
+                    if "x" in xy:
+                        e.x = round(max(-0.5, min(1.5, xy["x"])), 5)
+                    if "y" in xy:
+                        e.y = round(max(-0.5, min(1.5, xy["y"])), 5)
+                    n += 1
+    return {"ok": True, "moved": n, "revision": p.revision}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -508,21 +539,23 @@ def batch_move(name: str, req: BatchMoveReq):
 
 @router.post("/projects/{name}/undo")
 def undo(name: str):
-    stack = _undo.get(name) or []
-    if not stack:
-        return {"ok": False, "reason": "没有可撤销的操作"}
-    raw = stack.pop()
-    with open(os.path.join(store.dir_of(name), "project.json"), "w",
-              encoding="utf-8") as f:
-        f.write(raw)
-    p = _load(name)
+    """撤销一步
+
+    ★ 快照来自磁盘上的 `.history/`，所以**重启服务也不会丢**。
+    """
+    with store.locked(name):
+        raw = store.pop_history(name)
+        if raw is None:
+            return {"ok": False, "reason": "没有可撤销的操作"}
+        store.use_history(name, raw)                 # 写回
+        p = store.load(name)
     return {"ok": True, "project": p.model_dump(mode="json"),
-            "remaining": len(stack)}
+            "remaining": store.history_depth(name)}
 
 
 @router.get("/projects/{name}/undo-depth")
 def undo_depth(name: str):
-    return {"depth": len(_undo.get(name) or [])}
+    return {"depth": store.history_depth(name)}
 
 
 # ══════════════════════════════════════════════════════════════════

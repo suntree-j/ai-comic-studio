@@ -268,6 +268,147 @@ class SeedreamProvider(ImageProvider):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 硅基流动 SiliconFlow
+# ══════════════════════════════════════════════════════════════════
+
+#: 硅基流动的像素总量上限（实测 2048x1152 = 2359296 会报 400）
+SF_MAX_PIXELS = 2_073_600
+
+#: 我们内部的三种尺寸 → 硅基流动支持的 image_size
+#: 按比例取最接近的、且不超过像素上限的档位
+SF_SIZE_MAP: Dict[str, str] = {
+    SIZE_WIDE: "1536x1024",     # 1.46 → 1.50
+    SIZE_TALL: "1024x1536",     # 0.75 → 0.67
+    SIZE_SQUARE: "1440x1440",   # 1.00 → 1.00
+}
+
+
+class SiliconFlowProvider(ImageProvider):
+    """硅基流动（SiliconFlow）
+
+    为什么选它：国内可直连、有免费额度、同时提供 LLM 与生图，
+    一个 key 就能把「小说 → 漫画」整条链路跑通。
+
+    文档里的坑（本项目实测记录）：
+        · 字段是 `image_size`（不是 OpenAI 的 `size`），
+          形如 "1024x1024" 的字符串
+        · **像素总量上限 2073600** —— 2048x1152 会返回
+          `width * height should not exceed 2073600`
+        · 响应里图片在 `images[].url`（**不是** OpenAI 的 `data[].url`），
+          同时 `data` 字段也在，但结构与 OpenAI 不同，别按 OpenAI 解析
+        · `model` 必须在账号可用列表里，不可用的返回
+          `{"code":30003,"message":"Model disabled."}`
+        · 试过可用：Qwen/Qwen-Image、Kwai-Kolors/Kolors、
+          Tongyi-MAI/Z-Image-Turbo
+    """
+
+    name = "siliconflow"
+    supports_refs = True        # Qwen-Image-Edit 支持参考图
+    supports_seed = True
+
+    def __init__(self, api_key: Optional[str] = None,
+                 model: str = "Qwen/Qwen-Image",
+                 base_url: str = "https://api.siliconflow.cn/v1",
+                 timeout: float = 300.0,
+                 steps: int = 30,
+                 guidance: float = 4.0):
+        self.api_key = (api_key or os.environ.get("SILICONFLOW_API_KEY", "")
+                        or os.environ.get("SF_API_KEY", ""))
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.steps = steps
+        self.guidance = guidance
+
+    @staticmethod
+    def map_size(size: str) -> str:
+        """把内部尺寸映射到硅基流动支持的档位
+
+        认不出来就按传入值解析，并确保不超过像素上限
+        （超了就等比缩小到刚好达标）。
+        """
+        if size in SF_SIZE_MAP:
+            return SF_SIZE_MAP[size]
+        try:
+            w, h = (int(x) for x in size.lower().split("x"))
+        except Exception:                                   # noqa: BLE001
+            return "1024x1024"
+        if w * h > SF_MAX_PIXELS:
+            k = (SF_MAX_PIXELS / (w * h)) ** 0.5
+            w, h = int(w * k) // 16 * 16, int(h * k) // 16 * 16
+        return f"{max(256, w)}x{max(256, h)}"
+
+    def generate(self, req: ImageRequest) -> ImageResult:
+        if not self.api_key:
+            raise ImageError("缺少 SILICONFLOW_API_KEY")
+        try:
+            import httpx
+        except ImportError as e:                            # pragma: no cover
+            raise ImageError("需要 httpx") from e
+
+        size = self.map_size(req.size)
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "prompt": req.prompt,
+            "image_size": size,          # ★ 不是 "size"
+            "batch_size": 1,
+            "num_inference_steps": self.steps,
+            "guidance_scale": self.guidance,
+        }
+        # 负面提示词：硅基流动用 negative_prompt（部分模型支持）
+        if req.negative:
+            body["negative_prompt"] = req.negative
+        if req.seed is not None:
+            body["seed"] = req.seed
+        # 参考图：Qwen-Image-Edit 系列支持
+        if req.ref_images:
+            body["image"] = to_data_url(req.ref_images[0])
+
+        t0 = time.time()
+        try:
+            r = httpx.post(f"{self.base_url}/images/generations",
+                           headers={"Authorization": f"Bearer {self.api_key}",
+                                    "Content-Type": "application/json"},
+                           json=body, timeout=self.timeout)
+        except Exception as e:                              # noqa: BLE001
+            raise ImageError(f"请求失败：{e}") from e
+
+        # 模型不可用是「配置错」而不是额度问题，单独给清晰提示
+        if r.status_code == 403:
+            try:
+                msg = r.json().get("message", "")
+            except Exception:                               # noqa: BLE001
+                msg = r.text[:200]
+            if "disabled" in msg.lower():
+                raise ImageError(
+                    f"模型 {self.model} 在该账号不可用（Model disabled）。"
+                    f"可用模型见 GET /v1/models?type=image")
+        _check_quota(r.status_code, r.text)
+        if r.status_code >= 400:
+            raise ImageError(f"HTTP {r.status_code}（image_size={size}）："
+                             f"{r.text[:400]}")
+
+        data = r.json()
+        items = data.get("images") or []
+        if not items:
+            raise ImageError(f"响应无图片：{json.dumps(data)[:300]}")
+        url = items[0].get("url")
+        if not url:
+            raise ImageError(f"响应里没有 url：{json.dumps(items[0])[:300]}")
+
+        try:
+            rr = httpx.get(url, timeout=self.timeout, follow_redirects=True)
+            rr.raise_for_status()
+        except Exception as e:                              # noqa: BLE001
+            raise ImageError(f"下载图片失败：{e}") from e
+
+        return ImageResult(image=_img_from_bytes(rr.content),
+                           model=self.model,
+                           latency_ms=int((time.time() - t0) * 1000),
+                           seed=data.get("seed"), raw=data)
+
+
+# ══════════════════════════════════════════════════════════════════
 # OpenAI Images
 # ══════════════════════════════════════════════════════════════════
 
@@ -496,18 +637,21 @@ class GenericHTTPProvider(ImageProvider):
 # 工厂
 # ══════════════════════════════════════════════════════════════════
 
-IMAGE_PROVIDER_NAMES = ["mock", "seedream", "openai", "sd-webui", "generic-http"]
+IMAGE_PROVIDER_NAMES = ["mock", "siliconflow", "seedream", "openai",
+                        "sd-webui", "generic-http"]
 
 
 def get_image_provider(name: str = "mock", **kwargs) -> ImageProvider:
     """按名字取生图 Provider
 
     >>> get_image_provider("mock")
+    >>> get_image_provider("siliconflow", api_key="sk-...")
     >>> get_image_provider("seedream", api_key="...")
     >>> get_image_provider("sd-webui", base_url="http://127.0.0.1:7860")
     """
     table = {
         "mock": MockImageProvider,
+        "siliconflow": SiliconFlowProvider,
         "seedream": SeedreamProvider,
         "openai": OpenAIImagesProvider,
         "sd-webui": SDWebUIProvider,

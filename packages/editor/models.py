@@ -258,6 +258,10 @@ class EditProject(BaseModel):
     pages: List[Page] = Field(default_factory=list)
     #: 已分配过的最大页码 —— **只增不减**，删页也不回收
     max_number: int = 0
+    #: 版本号：每次 save 自增。给「乐观并发控制」用 ——
+    #: 客户端带上它发请求，服务端发现对不上就拒绝（说明别人先改了）。
+    #: 没有它的话，两个标签页同时编辑会「后写覆盖先写」。
+    revision: int = 0
 
     # ── 查询 ──────────────────────────────────────────────
     def asset(self, asset_id: str) -> Optional[Asset]:

@@ -68,7 +68,7 @@ def client(tmp_path, monkeypatch):
     import apps.api.editor as E
     monkeypatch.setattr(E, "WORKSPACE", str(tmp_path / "works"))
     monkeypatch.setattr(E, "store", EditStore(str(tmp_path / "works")))
-    E._undo.clear()
+    # 撤销快照现在落在项目的 .history/ 下，随临时目录一起隔离，无需手动清
     from fastapi.testclient import TestClient
     from apps.api.server import app
     return TestClient(app)
