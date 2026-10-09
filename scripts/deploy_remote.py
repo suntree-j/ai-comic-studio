@@ -89,7 +89,12 @@ def make_tarball() -> str:
     """只打包运行必需的文件（不含 docs/images、tests、.git）"""
     out = os.path.join(tempfile.gettempdir(), "aicomic-deploy.tar.gz")
     # scripts 也要传：服务器上要用它生成示例内容
-    include = ["packages", "apps", "scripts", "pyproject.toml",
+    # docs 也要传：体积很小（~1MB），解包后落在 REMOTE_DIR/docs/，
+    #   线上排查时可以直接 `cat` 看说明。
+    #   ★ 注意：应用**没有**把 docs 挂成静态路由（只有 /static → apps/workbench），
+    #     所以 http://<host>/comic/docs/editor.md 是 404 ——
+    #     这里上传是为了「服务器上有得看」，不是为了对外的文档站。
+    include = ["packages", "apps", "scripts", "docs", "pyproject.toml",
                "README.md", "LICENSE"]
 
     def flt(ti: tarfile.TarInfo):
