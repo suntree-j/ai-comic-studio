@@ -13,21 +13,27 @@
        boxes 画选择框，前后端不会各算一套而错位
     ③ **页码是身份，order 是顺序**：调顺序改 order，number 永不变
     ④ **撤销栈**：直接存整个 project.json 快照（文件很小，实现简单可靠）
+    ⑤ **渲染结果按「内容指纹」缓存**：key 里带页面内容哈希，
+       所以改了元素不会拿到旧图（详见下面「渲染缓存」一节）
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+from collections import OrderedDict
 from contextlib import contextmanager
 import json
 import os
+import threading
 import time
 import zipfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from packages.editor import (
@@ -117,6 +123,12 @@ def mutate(name: str, revision: Optional[int] = None
         snapshot(name)
         yield p
         store.save(p)
+    # 写完了：把该项目相关的渲染缓存丢掉。
+    # ★ 指纹（revision + 页面内容哈希）已经保证「不会返回旧图」，
+    #   这一步纯粹是**及时释放内存** —— 页面内容已经回不去了，
+    #   旧图留在缓存里只会白占内存，还要等 LRU 慢慢淘汰。
+    #   放在 with 外面：抛异常（409/400/404）时压根没写盘，不用清。
+    _render_cache.invalidate_project(name)
 
 
 def _find_page_of(project: EditProject, element_id: str) -> Page:
@@ -559,6 +571,182 @@ def undo_depth(name: str):
 
 
 # ══════════════════════════════════════════════════════════════════
+# 渲染缓存（LRU + 内容指纹）
+# ══════════════════════════════════════════════════════════════════
+
+def _env_cache_limit() -> int:
+    """缓存张数上限：默认 24
+
+    ★ 为什么要跟上限：一张 1240 宽的页面图在内存里约 6.6 MB
+      （1240×1771×3 字节），不设上限的话页数一多就吃光内存。
+      24 张 ≈ 160 MB，按需用 COMIC_EDITOR_CACHE 调。
+    """
+    try:
+        n = int(os.environ.get("COMIC_EDITOR_CACHE", "24"))
+    except ValueError:
+        n = 24
+    return n if n > 0 else 24
+
+
+def _cache_name(name: str) -> str:
+    """缓存 key 里的项目名统一成磁盘目录名（store.safe_name）
+
+    ★ 两边必须用同一套归一化：请求 URL 里的名字和 project.json 里的
+      `name` 字段可能是同一个名字的不同写法（比如带了个会被过滤掉的字符）。
+      归一化不一致的话 invalidate 会清不到东西 —— 不致命（指纹还在兜底），
+      但会白占内存，而且看起来「清了却没清」。
+    """
+    try:
+        return store.safe_name(name)
+    except ValueError:              # 全是非法字符，safe_name 会抛
+        return name or ""
+
+
+class _CachedRender(NamedTuple):
+    """一页的渲染结果：图 + 包围盒
+
+    ★ 图和盒子**必须成对存**，不能各存各的：
+      前端的选择框来自盒子、画面来自图，两者只要不是同一次渲染产出的，
+      就会出现「框和画对不上」—— 这正是 render.py 里
+      `image_box()` / `_draw_image_el()` 共用 `_render_image_piece()` 的原因，
+      缓存这一层不能又把它拆开。
+
+    ★ 图是**共享只读**的：render.png 只是编码它、elements-geometry 只读盒子、
+      导出（save_pdf / 长图）也只是读它（convert/resize 都返回新对象）。
+      以后谁要是往这张图上原地画，就会污染缓存里那一份 —— 别这么干。
+    """
+    image: Any
+    boxes: Dict[str, List[float]]
+
+
+class _RenderCache:
+    """按内容指纹缓存整页渲染结果，容量满了淘汰最久没用的那张
+
+    ★ 为什么 key 里必须有内容指纹，而不是只用 (项目, 页面 id, 宽度)：
+      用户改了元素再请求，服务端会把**改之前**那张图原样返回 ——
+      HTTP 200、图也是合法 JPEG、响应头也齐全，只是内容是旧的。
+      本仓库已经栽过两次这种「静默降级」（缺中文字体 → 渲染成方块但 200、
+      缺 python-multipart → 服务起不来但 systemd 显示 active），
+      共同点是「一切看起来都正常，只有内容是错的」，最难查。
+      所以这里不指望调用方记得清缓存，而是把「内容变没变」直接算进 key。
+
+    ★ 指纹 = revision + 页面序列化 + 本页引用到的素材描述：
+      · 页面序列化（含 elements / 画布尺寸 / 背景）→ 任何一处变了都失效
+      · revision → 任何一次写操作都会 +1，作用有两个：
+        ① **多进程部署的兜底**：进程 A 改了项目，进程 B 的内存缓存
+           谁也通知不到，只能靠重新读到的 revision 发现内容变了
+           （每个请求都会 store.load 一遍，所以这个兜底是免费的）；
+        ② 别的页改了也让这一页失效 —— 宁可少命中也不给旧图。
+        撤销会把 revision 写回旧值，但那时页面内容也一起回到了旧状态，
+        命中恰好是对的。
+      · 素材描述（id/文件名/尺寸）→ 素材记录变了要重画。
+        ★ 边界说清楚：素材经 API 上传后不再改写、文件名唯一，所以这里
+          只对 project.json 里的素材记录负责。如果有人绕过 API 直接替换
+          assets/ 里的同名文件（连尺寸都一样），指纹看不出来 ——
+          这种情况本项目不做保证，也不假装能兜住。
+
+    ★ 并发：两个线程同时未命中同一页就各渲染一次（多花一次算力，结果一样），
+      不做「单飞」合并 —— 那是另一种复杂度，这里不值当。
+      命中/未命中计数只给测试和排查看，不做精确统计。
+    """
+
+    def __init__(self, limit: Optional[int] = None):
+        self._limit = max(1, int(limit if limit is not None
+                                else _env_cache_limit()))
+        self._data: "OrderedDict[tuple, _CachedRender]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def key(self, project: EditProject, page: Page, width: int) -> tuple:
+        used = {e.asset_id for e in page.elements
+                if isinstance(e, ImageElement)}
+        assets = sorted(
+            [a.id, a.stored_name, a.width, a.height]
+            for a in project.assets if a.id in used)
+        raw = json.dumps(
+            {"rev": project.revision,
+             "page": page.model_dump(mode="json"),
+             "assets": assets},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        fp = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+        # ★ 不能只用 hash()：Python 的字符串哈希每次进程启动都不一样，
+        #   多 worker 部署下同一页会各算各的 key，缓存等于白做。
+        # ★ 宽度和 render_page 用同一套钳制（它也取 max(64, int(w))）：
+        #   否则 w=10 和 w=64 会各存一份**完全相同**的图。
+        # ★ 带上 store 根目录：不同工作区里的同名项目不能互相命中
+        #   （测试里每个用例一个临时工作区，名称又都叫 p1）。
+        return (store.root, _cache_name(project.name), page.id,
+                max(64, int(width)), fp)
+
+    def get(self, key: tuple) -> Optional[_CachedRender]:
+        with self._lock:
+            ent = self._data.get(key)
+            if ent is None:
+                self.misses += 1
+                return None
+            self._data.move_to_end(key)          # LRU：用完挪到队尾（最新）
+            self.hits += 1
+            return ent
+
+    def put(self, key: tuple, ent: _CachedRender) -> None:
+        with self._lock:
+            self._data[key] = ent
+            self._data.move_to_end(key)
+            while len(self._data) > self._limit:
+                self._data.popitem(last=False)   # 淘汰队头（最久没用）
+
+    def invalidate_project(self, name: str) -> None:
+        """丢掉某个项目的全部缓存（写操作之后调用）
+
+        指纹已经保证不会返回旧图，这条是省内存用的：让旧图立刻可以被回收。
+        """
+        prefix = (store.root, _cache_name(name))
+        with self._lock:
+            for k in [k for k in self._data if k[:2] == prefix]:
+                self._data.pop(k, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def stats(self) -> Dict[str, Any]:
+        """给测试和排查用：一眼看出缓存到底有没有在工作"""
+        with self._lock:
+            return {"size": len(self._data), "limit": self._limit,
+                    "hits": self.hits, "misses": self.misses}
+
+
+_render_cache = _RenderCache()
+
+
+def render_cached(project: EditProject, page: Page, width: int
+                  ) -> tuple[_CachedRender, str]:
+    """渲染一页（带缓存）→ (结果, "hit"|"miss")
+
+    ★ render.png / elements-geometry / 导出 三处**都走这里**：
+      共用同一份结果，才能保证「画面」和「选择框」永远出自同一次渲染。
+
+    ★ 一律按 with_boxes=True 渲染：实测同一页多算盒子只要 +2 ms
+      （705 → 707 ms，占总量 0.3%），但换来两个接口共用一份结果 ——
+      这点开销换「不可能错位」很值。
+    """
+    key = _render_cache.key(project, page, width)
+    ent = _render_cache.get(key)
+    if ent is not None:
+        return ent, "hit"
+    img, boxes = render_page(page, _asset_loader(project),
+                             target_width=width, with_boxes=True)
+    ent = _CachedRender(image=img, boxes=boxes)
+    _render_cache.put(key, ent)
+    return ent, "miss"
+
+
+# ══════════════════════════════════════════════════════════════════
 # 渲染（预览 / 导出共用）
 # ══════════════════════════════════════════════════════════════════
 
@@ -569,29 +757,39 @@ def render_png(name: str, page_id: str, w: int = 1240,
 
     `boxes=1` 时把元素包围盒放进响应头 `X-Element-Boxes`（base64 JSON）——
     前端据此画选择框，保证与服务端排版一致。
+
+    `X-Cache: hit|miss` 说明这张图是缓存来的还是现画的 ——
+    没有这个头，缓存出问题（比如永远不命中、或者命中过期内容）
+    从外面完全看不出来，只能靠猜。
     """
     p = _load(name)
     pg = _page(p, page_id)
-    img, boxmap = render_page(pg, _asset_loader(p), target_width=w,
-                              with_boxes=bool(boxes))
+    ent, state = render_cached(p, pg, w)
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=90, optimize=True)
-    headers = {"Cache-Control": "no-store"}
+    ent.image.save(buf, "JPEG", quality=90, optimize=True)
+    headers = {"Cache-Control": "no-store", "X-Cache": state}
     if boxes:
         payload = base64.b64encode(
-            json.dumps(boxmap, separators=(",", ":")).encode()).decode()
+            json.dumps(ent.boxes, separators=(",", ":")).encode()).decode()
         headers["X-Element-Boxes"] = payload
     return Response(buf.getvalue(), media_type="image/jpeg", headers=headers)
 
 
 @router.get("/projects/{name}/elements-geometry")
 def elements_geometry(name: str, page_id: str, w: int = 1240):
-    """只算几何不算图（拖拽时快速取新位置）"""
+    """只返回包围盒（拖拽时快速取新位置）
+
+    ★ 名字叫「不算图」，实际还是要整页渲染一遍才知道气泡多高、
+      图片缩放到哪（几何就是这么算出来的）。所以它和 render.png
+      共用同一份缓存：预览过的页面，拖拽时基本不用再等。
+    """
     p = _load(name)
     pg = _page(p, page_id)
-    _, boxmap = render_page(pg, _asset_loader(p), target_width=w,
-                            with_boxes=True)
-    return {"boxes": boxmap}
+    ent, state = render_cached(p, pg, w)
+    # jsonable_encoder：保持原来「返回 dict 交给 FastAPI 序列化」时的
+    # 类型兜底（万一盒子里混进 numpy 标量也不会 500）
+    return JSONResponse(jsonable_encoder({"boxes": ent.boxes}),
+                        headers={"X-Cache": state})
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -607,7 +805,9 @@ def export(name: str, fmt: str = "pdf", width: int = 1240,
     if not p.pages:
         raise HTTPException(400, "项目里没有页面")
     out = store.out_dir(name)
-    pages = [render_page(pg, _asset_loader(p), target_width=width)[0]
+    # ★ 走同一个缓存：刚才在界面上翻过的页面，导出时不用再重画一遍
+    #   （导出是「顺序渲染每一页」，页数多时这一项最费时间）
+    pages = [render_cached(p, pg, width)[0].image
              for pg in p.ordered_pages()]
 
     if fmt == "pdf":

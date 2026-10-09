@@ -252,3 +252,34 @@ button.danger:hover{background:#3a1c1c;border-color:var(--err)}
 /* ── 多选时的额外提示 ─────────────────────────── */
 .ov.sel::after{content:'';position:absolute;inset:-3px;border-radius:3px;
   box-shadow:0 0 0 1px #4a9eff66;pointer-events:none}
+
+/* ── 页面模板（分格预设）─────────────────────────
+   缩略图里的格子位置是用 editor.js 的 tplCells() 算出来的真实坐标，
+   所以「预览看到几格」= 「真的会生成几格、摆在哪」，图和结果不会各说各话。
+   缩略图按 7:10 画，和默认页面 1400×2000 一个比例 —— 预览的形状就是成品的形状。 */
+.tpl-sec{border:1px solid var(--line);border-radius:8px;background:var(--panel2);
+  padding:8px;margin-bottom:10px}
+.tpl-sec .sec-head{margin:0 0 7px}
+.tpl-hint{font-size:11px;color:var(--fg3)}
+.tpl-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.tpl-mini{display:flex;flex-direction:column;align-items:center;gap:4px;
+  padding:5px 3px;background:#12161b;border:1px solid var(--line);
+  border-radius:6px;cursor:pointer;transition:.12s}
+.tpl-mini:hover{border-color:var(--accent);background:#16202c}
+.tpl-mini:active{transform:scale(.96)}
+.tpl-thumb{position:relative;width:100%;aspect-ratio:7/10;background:#f3f5f8;
+  border:1px solid #3a4653;border-radius:2px;overflow:hidden}
+.tpl-cell{position:absolute;background:#c3ccd8;border:1px solid #8f9dad;
+  border-radius:1px}
+.tpl-cap{font-size:9.5px;line-height:1.2;color:var(--fg3);white-space:nowrap}
+.tpl-mini:hover .tpl-cap{color:var(--fg)}
+.tpl-sec .chk{margin-top:6px;font-size:11.5px}
+.tpl-sec .hint{font-size:11px;margin-top:7px;line-height:1.45}
+
+/* 空白页里的模板入口（比左栏的略大，因为这一屏除了它没别的可点） */
+.ec-tpl{margin-top:18px}
+.ec-tpl-title{font-size:12px;color:var(--fg3);margin-bottom:8px}
+.ec-tpl-row{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;
+  max-width:520px;margin:0 auto}
+.ec-tpl-row .tpl-mini{width:58px;flex:0 0 58px}
+.ec-tpl-row .tpl-cap{font-size:10px}

@@ -544,3 +544,258 @@ def test_image_box_rotation_is_not_guessed():
     # 真值 0.35，旧公式 0.1969*1.4 = 0.2757
     assert abs(turned[3] - 0.196875 * 1.4) > 0.05, \
         "看着还像老的 *1.4 估法"
+
+
+# ══════════════════════════════════════════════════════════════════
+# ⑦ 渲染缓存：命中要看得见、内容变了要失效、容量有上限
+# ══════════════════════════════════════════════════════════════════
+
+@pytest.fixture(autouse=True)
+def _clean_render_cache():
+    """每个用例前后都清一次渲染缓存
+
+    ★ 缓存是模块级的、跨用例存活。不清的话上一个用例缓存的页面会占着
+      名额，「命中」和「容量上限」两条断言就会互相干扰 ——
+      排查半天发现是测试自己的问题最浪费时间。
+    """
+    import apps.api.editor as E
+    E._render_cache.clear()
+    yield
+    E._render_cache.clear()
+
+
+def _render(client, name, pid, w=300, boxes=0):
+    r = client.get(f"{P}/projects/{name}/pages/{pid}/render.png"
+                   f"?w={w}&boxes={boxes}")
+    assert r.status_code == 200, r.text[:200]
+    return r
+
+
+def _add_bubble(client, name, pid, text="台词", x=0.06, y=0.06):
+    """加一个气泡，返回 element_id
+
+    ★ 显式给 x/y：不给的话服务端要调 auto_place_bubble 找空位，
+      而它内部会 render_page —— 会污染「渲染次数」的计数。
+    """
+    r = client.post(f"{P}/projects/{name}/pages/{pid}/elements",
+                    json={"kind": "bubble", "text": text,
+                          "x": x, "y": y, "w": 0.34})
+    assert r.status_code == 200, r.text[:200]
+    return r.json()["element"]["id"]
+
+
+def _two_page_project(client, name="c"):
+    client.post(f"{P}/projects", json={"name": name})
+    pid1 = client.get(f"{P}/projects/{name}").json()["pages"][0]["id"]
+    pid2 = client.post(f"{P}/projects/{name}/pages",
+                       json={"title": "第二页"}).json()["page"]["id"]
+    return pid1, pid2
+
+
+def test_render_cache_hit_miss_and_identical_bytes(client):
+    """★ 验收：同一页连请求 3 次 → miss / hit / hit，且三次字节完全一样
+
+    为什么要断言「三次字节一样」：命中时返回的必须是**同一张图**，
+    不是「重新画了一遍看起来差不多」的图。字节一样才算真缓存。
+    """
+    pid = _project(client, "c1")
+    _add_bubble(client, "c1", pid, "缓存命中测试")
+
+    r1 = _render(client, "c1", pid, boxes=1)
+    r2 = _render(client, "c1", pid, boxes=1)
+    r3 = _render(client, "c1", pid, boxes=1)
+
+    assert [r1.headers["X-Cache"], r2.headers["X-Cache"],
+            r3.headers["X-Cache"]] == ["miss", "hit", "hit"], \
+        f"X-Cache 不对：{[x.headers['X-Cache'] for x in (r1, r2, r3)]}"
+    assert r1.content == r2.content == r3.content, "命中返回的图与首张不一致"
+    # 命中也要照常回包围盒（前端画选择框靠它）
+    assert "X-Element-Boxes" in r2.headers
+
+
+def test_render_cache_hit_does_not_rerender(client, monkeypatch):
+    """★ 命中的那次不能再真的渲染一遍 —— 否则「缓存」只是多了个头
+
+    直接数 `render_page` 被调了几次：第 2、3 次请求只能有 1 次渲染。
+    """
+    import apps.api.editor as E
+    pid = _project(client, "c2")
+    _add_bubble(client, "c2", pid, "只该渲染一次")
+
+    calls = []
+    real = E.render_page
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(E, "render_page", counting)
+    _render(client, "c2", pid)
+    _render(client, "c2", pid)
+    _render(client, "c2", pid)
+    assert len(calls) == 1, f"渲染了 {len(calls)} 次，应该只有 1 次"
+
+
+def test_render_cache_invalidated_when_content_changes(client):
+    """★ 回归：改了元素之后必须重画，不能返回「HTTP 200 的过期图」
+
+    这是本项目最容易出的那类事故（200 + 合法 JPEG + 内容是旧的）。
+    所以不能只清缓存了事，得靠内容指纹自己失效。
+    """
+    pid = _project(client, "c3")
+    eid = _add_bubble(client, "c3", pid, "改之前")
+    first = _render(client, "c3", pid, boxes=1)
+    assert _render(client, "c3", pid).headers["X-Cache"] == "hit"
+
+    client.patch(f"{P}/projects/c3/elements/{eid}",
+                 json={"props": {"text": "改之后，文字长了一点点"}})
+
+    after = _render(client, "c3", pid, boxes=1)
+    assert after.headers["X-Cache"] == "miss", "内容变了还命中 → 会返回旧图"
+    assert after.content != first.content, "内容变了但图没变"
+    # 改完再请求一次，恢复命中
+    assert _render(client, "c3", pid).headers["X-Cache"] == "hit"
+
+
+def test_render_and_geometry_share_one_entry(client, monkeypatch):
+    """★ 画面与选择框必须出自同一次渲染（缓存不能把它拆开）
+
+    两边顺序都试：先预览再拖拽、先拖拽再预览，第二个都该是命中，
+    而且两边拿到的盒子必须完全一致 —— 这就是「同源」的守门员。
+    """
+    import base64
+    import json as _json
+    import apps.api.editor as E
+    pid = _project(client, "c4")
+    _add_bubble(client, "c4", pid, "几何与画面同源")
+    calls = []
+    real = E.render_page
+    monkeypatch.setattr(E, "render_page",
+                        lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
+
+    # ① 先 render.png 再 elements-geometry
+    r = _render(client, "c4", pid, boxes=1)
+    assert r.headers["X-Cache"] == "miss"
+    g = client.get(f"{P}/projects/c4/elements-geometry?page_id={pid}&w=300")
+    assert g.headers["X-Cache"] == "hit", "geometry 没有复用 render.png 的结果"
+    boxes_from_png = _json.loads(base64.b64decode(r.headers["X-Element-Boxes"]))
+    assert boxes_from_png == g.json()["boxes"], "两个接口的盒子不一致"
+    assert len(calls) == 1, f"同一页渲染了 {len(calls)} 次"
+
+    # ② 换一页：先 geometry 再 render.png，反向也要共用
+    pid2 = client.post(f"{P}/projects/c4/pages",
+                       json={"title": "第二页"}).json()["page"]["id"]
+    _add_bubble(client, "c4", pid2, "反向也要同源")
+    g2 = client.get(f"{P}/projects/c4/elements-geometry?page_id={pid2}&w=300")
+    assert g2.headers["X-Cache"] == "miss"
+    r2 = _render(client, "c4", pid2, boxes=1)
+    assert r2.headers["X-Cache"] == "hit", "render.png 没有复用 geometry 的结果"
+    assert _json.loads(base64.b64decode(r2.headers["X-Element-Boxes"])) \
+        == g2.json()["boxes"]
+    assert len(calls) == 2, f"总共该渲染 2 次，实际 {len(calls)} 次"
+
+
+def test_render_cache_evicts_lru_at_capacity(client, monkeypatch):
+    """★ 容量上限 + LRU 顺序（不是先进先出）
+
+    上限设 2。为了让这条能区分 LRU 和 FIFO，顺序要挑一下：
+        p1 miss → p2 miss → **p1 hit**（p1 变成最近用过，p2 变成最久没用）
+        → p3 miss 时该挤掉 p2（LRU），FIFO 会挤掉 p1。
+    所以「p1 仍然 hit、p2 反而 miss」才是 LRU 的证据。
+
+    ★ 一开始按「p1 miss→p2 miss→p2 hit→p3 miss→p1 miss→p2 hit」写，
+      最后一条红了 —— 实际上是**测试写错了**：重新请求 p1 会把它插回缓存，
+      此时最久没用的是 p2，被挤掉才对。
+    """
+    import apps.api.editor as E
+    monkeypatch.setattr(E, "_render_cache", E._RenderCache(limit=2))
+    pid1, pid2 = _two_page_project(client, "c5")
+    pid3 = client.post(f"{P}/projects/c5/pages",
+                       json={"title": "第三页"}).json()["page"]["id"]
+
+    def cache_of(pid):
+        return _render(client, "c5", pid).headers["X-Cache"]
+
+    assert cache_of(pid1) == "miss"
+    assert cache_of(pid2) == "miss"
+    assert cache_of(pid1) == "hit"          # p1 变成最近用过 → p2 变成最久没用
+    assert cache_of(pid3) == "miss"         # 超上限，挤掉最久没用的 p2
+    assert E._render_cache.stats()["size"] <= 2
+    assert cache_of(pid1) == "hit", "刚用过的 p1 被挤掉了（淘汰成了 FIFO）"
+    assert cache_of(pid2) == "miss", "p2 才是最久没用的，却没被淘汰"
+    assert E._render_cache.stats()["size"] <= 2
+
+
+def test_render_cache_key_uses_content_fingerprint(client):
+    """★ key 的结构：项目 / 页面 / 宽度 / 内容指纹，一个都不能少
+
+    直接验 key 本身，比只看 HTTP 行为更能说明「为什么不会串」。
+    """
+    import apps.api.editor as E
+    pid = _project(client, "c6")
+    eid = _add_bubble(client, "c6", pid, "原始文字")
+
+    p = E.store.load("c6")
+    page = p.page(pid)
+    k = E._render_cache.key(p, page, 800)
+
+    assert k[0] == E.store.root            # 工作区（不同工作区同名项目不能串）
+    assert k[1] == "c6"                    # 项目名
+    assert k[2] == pid                     # 页面 id
+    assert k[3] == 800                     # 目标宽度
+    assert len(k[4]) == 20                 # 内容指纹
+
+    assert E._render_cache.key(p, page, 900) != k, "宽度不同必须是两个 key"
+
+    # 只改元素文字 → 指纹必须变（这就是「不返回旧图」的根据）
+    page.elements[0].text = "换了一句话"
+    assert E._render_cache.key(p, page, 800) != k, "内容变了指纹没变"
+
+    # 内容一样但 revision 变了 → 也要变（宁可少命中，不给旧图）
+    p2 = E.store.load("c6")
+    p2.revision += 1
+    assert E._render_cache.key(p2, p2.page(pid), 800) != k, \
+        "revision 变了 key 没变，写操作就失效不了缓存"
+
+
+def test_writes_drop_this_projects_cache(client):
+    """写操作结束后，该项目的缓存条目被立刻丢掉（省内存，不等 LRU）"""
+    import apps.api.editor as E
+    pid = _project(client, "c7")
+    _add_bubble(client, "c7", pid, "写操作清缓存")
+    _render(client, "c7", pid)
+    assert E._render_cache.stats()["size"] == 1
+    client.patch(f"{P}/projects/c7/pages/{pid}", json={"title": "改个标题"})
+    assert E._render_cache.stats()["size"] == 0, "写操作后旧图还占着内存"
+
+
+def test_export_reuses_rendered_pages(client, monkeypatch):
+    """★ 导出也该受益：界面上翻过的页，导出时不用再重画
+
+    这条直接数渲染次数：两页都预览过之后再导出，渲染次数不能增加。
+    """
+    import apps.api.editor as E
+    pid1, pid2 = _two_page_project(client, "c8")
+    _add_bubble(client, "c8", pid1, "第一页的台词")
+    _add_bubble(client, "c8", pid2, "第二页的台词")
+
+    calls = []
+    real = E.render_page
+    monkeypatch.setattr(E, "render_page",
+                        lambda *a, **kw: (calls.append(1), real(*a, **kw))[1])
+
+    _render(client, "c8", pid1, w=400)
+    _render(client, "c8", pid2, w=400)
+    assert len(calls) == 2, "预览两页应该渲染 2 次"
+    before = _render(client, "c8", pid1, w=400).content   # 缓存里那张图
+
+    r = client.post(f"{P}/projects/c8/export?fmt=zip&width=400", json={})
+    assert r.status_code == 200, r.text[:200]
+    assert len(calls) == 2, f"导出又重画了 {len(calls) - 2} 页，缓存没被复用"
+
+    # ★ 导出不能把缓存里那张图弄脏：导出是只读的（convert/resize 都返回新对象），
+    #   这条守住「共享同一张 PIL 图」这个前提 —— 谁要是以后在导出里原地画，
+    #   用户下次预览就会看到被涂改的图，而且只有肉眼看图才发现。
+    after = _render(client, "c8", pid1, w=400)
+    assert after.headers["X-Cache"] == "hit"
+    assert after.content == before, "导出之后缓存里那张图变了（被原地修改）"
