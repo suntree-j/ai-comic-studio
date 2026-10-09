@@ -195,19 +195,43 @@ class ComicPipeline:
     # ── 自动排版（★ 页码一经分配即冻结） ────────────────────
     @staticmethod
     def _auto_layout(boards: List[Storyboard], plan) -> Layout:
+        """自动排版
+
+        ★ 一页**装多格**，不是一格一页。
+          之前是「每个镜头单独一页」，7 格就出 7 页、每页只有一条横条，
+          而 `packages/render/page.py` 里的 `paginate()` 明明已经写好
+          （按高度装箱、最后一页太挤会并回上一页）却从没被调用过 —— 死代码。
+          IR-009 只要求「同一镜头不得重复占用两页」，允许一页多格。
+        """
+        from ..render.page import paginate
+
         pages: List[LayoutPage] = []
         n = 1
 
         # 全书卷首
         pages.append(LayoutPage(page=n, type=PageType.TITLE,
-                                title="（封面待填）")); n += 1
-        # 每章一个卷首 + 逐格成页
+                                title="（封面待填）"))
+        n += 1
+        # 每章一个卷首 + 逐格装箱成页
         for sb in boards:
             pages.append(LayoutPage(page=n, type=PageType.TITLE,
-                                    title=f"第{sb.chapter}章")); n += 1
+                                    title=f"第{sb.chapter}章"))
+            n += 1
+            # 按「格子的实际渲染高度」装箱：
+            # 竖幅格子占高度，横幅格子矮 —— 用比例估算即可，
+            # 真正决定分页效果的是页面合成那一步。
+            heights: List[tuple] = []
             for p in sb.panels:
+                try:
+                    w, h = (int(x) for x in p.size.value.lower().split("x"))
+                    ratio = h / max(1, w)
+                except Exception:                           # noqa: BLE001
+                    ratio = 1.0
+                heights.append((p.id, int(1000 * ratio)))
+            for group in paginate(heights):
                 pages.append(LayoutPage(page=n, type=PageType.PANELS,
-                                        panels=[p.id])); n += 1
+                                        panels=list(group)))
+                n += 1
         return Layout(total=len(pages), pages=pages)
 
 

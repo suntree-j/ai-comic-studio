@@ -135,6 +135,53 @@ def make_demo_tarball() -> str:
 # ② 服务器准备
 # ══════════════════════════════════════════════════════════════════
 
+def push_env_file() -> None:
+    """把本地密钥推到服务器的 .env（systemd 的 EnvironmentFile）
+
+    ★ 为什么单独做：
+      · key **不进 git**（`.env` 在 .gitignore 里）
+      · key **不写进 systemd unit**（unit 会被日志、截图、`systemctl cat` 带出去）
+      · 只读本地环境变量 / 本地 .env，没有就跳过 ——
+        线上默认还是 mock，公开 Demo 不会因为配了 key 就被人刷额度
+
+    支持的键（有哪个传哪个）：
+        SILICONFLOW_API_KEY / SILICONFLOW_LLM_MODEL / SILICONFLOW_IMAGE_MODEL
+        ARK_API_KEY / OPENAI_API_KEY / COMIC_IMAGE_PROVIDER
+    """
+    keys = ["SILICONFLOW_API_KEY", "SF_API_KEY",
+            "SILICONFLOW_LLM_MODEL", "SILICONFLOW_IMAGE_MODEL",
+            "ARK_API_KEY", "OPENAI_API_KEY", "COMIC_IMAGE_PROVIDER"]
+
+    # ① 先看环境变量
+    vals = {k: os.environ[k] for k in keys if os.environ.get(k)}
+
+    # ② 再看本地 .env（不覆盖环境变量）
+    local = os.path.join(ROOT, ".env")
+    if os.path.isfile(local):
+        for line in open(local, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k in keys and k not in vals and v:
+                vals[k] = v
+
+    if not vals:
+        print("   没找到密钥（本地环境变量或 .env 都没有）→ 服务器保持 mock")
+        return
+
+    body = "\n".join(f"{k}={v}" for k, v in sorted(vals.items()))
+    # 原子写 + 只给 root 读（密钥别让别的用户 / 进程读走）
+    sh(f"umask 077 && cat > {REMOTE_DIR}/.env <<'ENVEOF'\n{body}\nENVEOF")
+    sh(f"chmod 600 {REMOTE_DIR}/.env")
+    names = ", ".join(sorted(vals))
+    print(f"   已写入 .env（权限 600）：{names}")
+    if "COMIC_IMAGE_PROVIDER" not in vals:
+        print("   ⚠️ 没设 COMIC_IMAGE_PROVIDER —— 线上仍是 mock（不会真出图）。")
+        print("      要开真出图：在 .env 里加 COMIC_IMAGE_PROVIDER=siliconflow")
+
+
 SERVICE = f"""[Unit]
 Description=AI Comic Studio (FastAPI workbench + render engine)
 Documentation=https://github.com/
@@ -146,6 +193,11 @@ WorkingDirectory={REMOTE_DIR}
 Environment=COMIC_PROJECTS={REMOTE_DIR}/projects
 Environment=COMIC_IMAGE_PROVIDER=mock
 Environment=COMIC_BASE_PATH={BASE_PATH}
+# ★ 密钥放这里，不写进 unit 文件 ——
+#   unit 文件是给人看/给日志抄的，密钥混在里面早晚泄漏到日志或截图里。
+#   systemd 允许 EnvironmentFile 指向不存在的文件（会静默跳过），
+#   所以没配密钥时一切照常。
+EnvironmentFile=-{REMOTE_DIR}/.env
 ExecStart={REMOTE_DIR}/venv/bin/python -m apps.api.server \\
     --host 127.0.0.1 --port {PORT} --base-path {BASE_PATH} --provider mock
 Restart=on-failure
@@ -478,6 +530,7 @@ def main() -> int:
         return verify()
 
     prepare()
+    push_env_file()          # ★ 必须在 install_service 之前：要重启服务才生效
     upload_code()
     install_service()
     install_nginx()

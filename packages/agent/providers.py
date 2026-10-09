@@ -210,11 +210,22 @@ class OpenAICompatProvider(LLMProvider):
     supports_json_schema = True
 
     def __init__(self, model: str, base_url: str, api_key: str,
-                 timeout: float = 120.0, name: str = "openai-compat"):
+                 timeout: float = 300.0, name: str = "openai-compat",
+                 net_retries: int = 2):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        #: ★ 默认 300s 而不是 120s：
+        #:   实测 DeepSeek-V3.2 处理 2600 字原文的提示词要 60-90s，
+        #:   峰值会超过 120s，于是 httpx 读超时 →
+        #:   而 repair_until_valid 里 provider 的 retries=0（重试权归修复循环），
+        #:   一次超时就白吃一轮，两轮就把整章判成 pending_human。
         self.timeout = timeout
+        #: ★ 网络层重试（超时 / 连不上）。
+        #:   注意这**不是**「让模型重答」—— 那由 repair 循环负责。
+        #:   两者分开，才不会「两层重试互相吃掉轮次」。
+        #:   4xx 不重试（那是请求本身的问题，重试也是白搭）。
+        self.net_retries = net_retries
         self.name = name
 
     def chat(self, messages, *, temperature=0.3, max_tokens=8192,
@@ -238,15 +249,30 @@ class OpenAICompatProvider(LLMProvider):
             }
 
         t0 = time.time()
-        try:
-            r = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}",
-                         "Content-Type": "application/json"},
-                json=body, timeout=self.timeout,
-            )
-        except Exception as e:                            # noqa: BLE001
-            raise LLMError(f"请求 {self.base_url} 失败：{e}") from e
+        # ★ 只对**网络层**失败重试（读超时 / 连接被断），不重试 4xx。
+        #   这是「请求没发成功」，不是「模型答得不好」——
+        #   后者由 repair 循环处理。把两件事分开，轮次才不会被互相吃掉。
+        last_exc: Optional[Exception] = None
+        r = None
+        for net_try in range(self.net_retries + 1):
+            try:
+                r = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}",
+                             "Content-Type": "application/json"},
+                    json=body, timeout=self.timeout,
+                )
+                break
+            except Exception as e:                        # noqa: BLE001
+                last_exc = e
+                if net_try >= self.net_retries:
+                    raise LLMError(
+                        f"请求 {self.base_url} 失败（试了 "
+                        f"{self.net_retries + 1} 次，每次超时 {self.timeout:.0f}s）："
+                        f"{e}") from e
+                time.sleep(2.0 * (net_try + 1))           # 退避一下再试
+        if r is None:                                      # pragma: no cover
+            raise LLMError(f"请求失败：{last_exc}")
 
         if r.status_code >= 400:
             raise LLMError(f"HTTP {r.status_code}：{r.text[:400]}")

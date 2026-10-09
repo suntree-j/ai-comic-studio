@@ -161,3 +161,94 @@ def test_pipeline_uses_bible_for_consistency():
     assert "mu_ningxue" in sent          # 角色表
     assert "ice_corridor" in sent        # 场景表
     assert "距离" in sent                 # 硬规则
+
+
+# ══════════════════════════════════════════════════════════════════
+# 自动排版：一页装多格
+# ══════════════════════════════════════════════════════════════════
+
+def _fake_storyboard(chapter, n: int, size: str = "2048x1400"):
+    """chapter 用字符串（Storyboard.chapter 是 str，不是 int）"""
+    from packages.ir import Panel, PanelSize, ShotSize, Storyboard
+
+    cid = str(chapter)
+    panels = []
+    for i in range(1, n + 1):
+        panels.append(Panel(
+            id=f"ch{cid}_P{i:03d}", seq=i, size=PanelSize(size),
+            shot=ShotSize.MEDIUM, action="测试动作",
+        ))
+    return Storyboard(chapter=cid, panels=panels)
+
+
+def test_auto_layout_packs_multiple_panels_per_page():
+    """★ 回归：一页要装多格，不是一格一页
+
+    `packages/render/page.py` 里的 `paginate()` 按高度装箱、
+    最后一页太空还会并回上一页 —— 但它**从没被调用过**（死代码）。
+    结果 7 格出 7 页、每页只有一条横条。
+    """
+    from packages.agent.pipeline import ComicPipeline
+    from packages.ir import PageType
+
+    boards = [_fake_storyboard(2436, 7)]
+    layout = ComicPipeline._auto_layout(boards, None)
+
+    panel_pages = [p for p in layout.pages if p.type is PageType.PANELS]
+    assert panel_pages, "应该有分格页"
+    assert len(panel_pages) < 7, \
+        f"7 格不该出 {len(panel_pages)} 页（一格一页的老毛病）"
+    assert any(len(p.panels) > 1 for p in panel_pages), \
+        "至少有一页要装超过一格"
+
+
+def test_auto_layout_covers_every_panel_exactly_once():
+    """IR-009：每个镜头必须被引用且**只能出现一次**"""
+    from packages.agent.pipeline import ComicPipeline
+    from packages.ir import PageType
+
+    boards = [_fake_storyboard(2436, 9), _fake_storyboard(2437, 6)]
+    layout = ComicPipeline._auto_layout(boards, None)
+
+    seen = []
+    for p in layout.pages:
+        if p.type is PageType.PANELS:
+            seen.extend(p.panels)
+    want = [p.id for sb in boards for p in sb.panels]
+    assert sorted(seen) == sorted(want), "有镜头漏掉或重复"
+    assert len(seen) == len(set(seen)), "同一镜头出现在了两页"
+
+
+def test_auto_layout_page_numbers_are_contiguous():
+    """页码必须 1..N 连号（页码分配即冻结，不能有洞）"""
+    from packages.agent.pipeline import ComicPipeline
+
+    layout = ComicPipeline._auto_layout(
+        [_fake_storyboard(2436, 5), _fake_storyboard(2437, 4)], None)
+    assert [p.page for p in layout.pages] == \
+        list(range(1, len(layout.pages) + 1))
+    assert layout.total == len(layout.pages)
+
+
+def test_auto_layout_has_book_and_chapter_titles():
+    """卷首：全书一张 + 每章一张"""
+    from packages.agent.pipeline import ComicPipeline
+    from packages.ir import PageType
+
+    layout = ComicPipeline._auto_layout(
+        [_fake_storyboard(2436, 3), _fake_storyboard(2437, 3)], None)
+    titles = [p for p in layout.pages if p.type is PageType.TITLE]
+    assert len(titles) == 3, f"1 张全书卷首 + 2 张章节卷首，得到 {len(titles)}"
+    assert "2436" in titles[1].title and "2437" in titles[2].title
+
+
+def test_auto_layout_vertical_panels_take_more_room():
+    """竖幅格子比横幅高 → 同样数量下页数不该更少"""
+    from packages.agent.pipeline import ComicPipeline
+    from packages.ir import PageType
+
+    wide = ComicPipeline._auto_layout([_fake_storyboard(1, 10, "2048x1400")], None)
+    tall = ComicPipeline._auto_layout([_fake_storyboard(1, 10, "1332x1776")], None)
+    nw = len([p for p in wide.pages if p.type is PageType.PANELS])
+    nt = len([p for p in tall.pages if p.type is PageType.PANELS])
+    assert nt >= nw, f"竖幅 {nt} 页不该少于横幅 {nw} 页"
