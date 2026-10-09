@@ -59,6 +59,13 @@ def main() -> int:
     ap.add_argument("--llm", default="deepseek-ai/DeepSeek-V3.2")
     ap.add_argument("--image", default="Kwai-Kolors/Kolors")
     ap.add_argument("--panels", type=int, default=4)
+    # ★ 硅基流动按 IPM（每分钟请求数）限流，连打 8-9 格很容易撞上。
+    #   实测第 8 格起返回 429「IPM limit reached」。
+    #   默认留 6 秒间隔：既不打满限流，也不至于太慢。
+    ap.add_argument("--delay", type=float, default=6.0,
+                    help="每格之间的间隔秒数（防 IPM 限流）")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="被限流时重试几次")
     ap.add_argument("--out", default=os.path.join(ROOT, "out", "real_pipeline"))
     ap.add_argument("--api-key", default=os.environ.get("SILICONFLOW_API_KEY", ""))
     a = ap.parse_args()
@@ -120,31 +127,65 @@ def main() -> int:
 
     # ── ④ 真实生图 ────────────────────────────────────────
     from packages.render.prompt import build_prompt, build_negative
-    from packages.render.providers import ImageRequest, get_image_provider
+    from packages.render.providers import (
+        ImageRequest, QuotaExceeded, RateLimited, get_image_provider)
 
     iprov = get_image_provider("siliconflow", api_key=a.api_key, model=a.image)
-    print(f"\n④ 真实生图（{len(panels)} 格，串行）")
+    print(f"\n④ 真实生图（{len(panels)} 格，串行，间隔 {a.delay:.0f}s）")
     panel_dir = os.path.join(a.out, "panels")
     os.makedirs(panel_dir, exist_ok=True)
-    images = []
+    images, failed = [], []
     for i, p in enumerate(panels, 1):
         prompt = build_prompt(bible, p)
         fp = os.path.join(panel_dir, f"{p.id}.png")
-        t1 = time.time()
-        try:
-            res = iprov.generate(ImageRequest(
-                prompt=prompt, size=p.size.value, negative=build_negative(p)))
-            if not res.ok:
-                print(f"   ❌ {p.id} 返回空图")
-                continue
+        # ★ 撞上限流就等一下重试，而不是丢掉这一格。
+        #   硅基流动按 IPM（每分钟请求数）限流，8-9 格连着打很容易撞上。
+        res, rate_err = None, None
+        for attempt in range(a.retries + 1):
+            t1 = time.time()
+            try:
+                res = iprov.generate(ImageRequest(
+                    prompt=prompt, size=p.size.value,
+                    negative=build_negative(p)))
+                break
+            except RateLimited as e:
+                rate_err = e
+                if attempt >= a.retries:
+                    break
+                wait = a.delay * 2 * (attempt + 1)
+                print(f"   ⏳ [{i}/{len(panels)}] {p.id} 被限流，"
+                      f"等 {wait:.0f}s 再试（第 {attempt + 2} 次）")
+                time.sleep(wait)
+            except QuotaExceeded as e:
+                print(f"   ❌ [{i}/{len(panels)}] {p.id} 额度不足：{str(e)[:110]}")
+                print("      ⛔ 额度问题重试没意义，停止。")
+                failed.append(p.id)
+                break
+            except Exception as e:                          # noqa: BLE001
+                print(f"   ❌ [{i}/{len(panels)}] {p.id} "
+                      f"{type(e).__name__}: {str(e)[:130]}")
+                failed.append(p.id)
+                break
+
+        if rate_err is not None and res is None:
+            print(f"   ❌ [{i}/{len(panels)}] {p.id} 重试 {a.retries} 次"
+                  f"仍被限流")
+            failed.append(p.id)
+        elif res is not None and res.ok:
             res.image.save(fp)
             images.append((p, res.image))
             print(f"   ✅ [{i}/{len(panels)}] {p.id}  {res.image.size}  "
                   f"{time.time() - t1:.1f}s  seed={res.seed}")
-        except Exception as e:                              # noqa: BLE001
-            print(f"   ❌ {i}/{len(panels)} {p.id}  {type(e).__name__}: "
-                  f"{str(e)[:140]}")
+        elif res is not None:
+            print(f"   ❌ [{i}/{len(panels)}] {p.id} 返回空图")
+            failed.append(p.id)
 
+        # 主动限速：别把 IPM 打满
+        if a.delay and i < len(panels):
+            time.sleep(a.delay)
+
+    print(f"   出图 {len(images)}/{len(panels)}"
+          + (f"，失败 {failed}" if failed else ""))
     if not images:
         print("\n   ❌ 一张都没出成")
         return 1

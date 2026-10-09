@@ -175,6 +175,7 @@ const EMPTY_HTML = `
       <button class="ghost" id="ecBubble">加气泡</button>
       <button class="ghost" id="ecText">加标题</button>
     </div>
+    <div class="ec-tpl" id="ecTplSlot"></div>
   </div>`;
 
 async function drawCanvas(fast) {
@@ -188,6 +189,7 @@ async function drawCanvas(fast) {
     bind('#ecUpload', () => $('#fileInput').click());
     bind('#ecBubble', () => addElement('bubble'));
     bind('#ecText', () => addElement('text'));
+    mountEmptyTemplates();              // 空白页里直接给分格模板，省一步去左栏找
     $('#layerCount').textContent = '0';
     updatePageLabel();
     return;
@@ -289,7 +291,7 @@ function label(e) {
   if (e.kind === 'bubble') return (e.speaker ? e.speaker + '：' : '') +
     (e.text || '').slice(0, 12);
   if (e.kind === 'text') return '字 ' + (e.text || '').slice(0, 12);
-  return '色块';
+  return e.name || '色块';        // 模板生成的分格有名字（分格 1…），显示出来才分得清
 }
 
 function applyZoom(holder) {
@@ -909,6 +911,7 @@ function renderAssets() {
   const host = $('#assetList');
   const list = S.proj.assets || [];
   $('#assetCount').textContent = String(list.length);
+  refreshTemplateUi();                  // 素材数是「按顺序填入素材」的前提，上传完要更新
   host.innerHTML = '';
   if (!list.length) {
     host.innerHTML = '<div class="hint pad">还没有素材</div>';
@@ -975,6 +978,7 @@ function renderPages() {
     host.appendChild(it);
   });
   if (!pages.length) host.innerHTML = '<div class="hint pad">还没有页面</div>';
+  refreshTemplateUi();                  // 元素数变了，「先清空这一页（N 个）」要跟着更新
 }
 
 function updatePageLabel() {
@@ -1638,6 +1642,7 @@ function newProjectDialog() {
  * 事件绑定
  * ══════════════════════════════════════════════════ */
 function bind() {
+  mountTemplateUi();                    // 页面模板区是 JS 注入的（不动 editor.html）
   $('#projectSel').onchange = (e) => openProject(e.target.value);
   $('#btnNew').onclick = newProjectDialog;
   $('#btnUndo').onclick = undo;
@@ -1809,6 +1814,294 @@ function bind() {
 }
 
 /* ══════════════════════════════════════════════════
+ * 页面模板（分格预设）
+ * ══════════════════════════════════════════════════
+ *
+ * 为什么需要：新建页面永远是一张白纸，而漫画最常见的排版就是固定分格。
+ * 让用户一张张摆图、手算坐标，是最费时间也最容易摆歪的一步。
+ *
+ * ★ 为什么占位格用 kind="shape" 而不是 kind="image"（去代码里确认过）：
+ *   apps/api/editor.py 的 add_element()，kind=image 会先 p.asset(asset_id)，
+ *   拿不到就 `HTTPException(400, "需要有效的 asset_id")`。
+ *   而「刚新建一页、还没上传任何素材」恰恰是最需要套模板的时刻 ——
+ *   用 image 会直接 400，模板功能等于废掉。
+ *   kind=shape 不查素材表，x/y/w/h 和 fill/line/line_width/radius 都能直接给，
+ *   render.py:_draw_shape_el() 会真的把这个矩形画进整页图，
+ *   于是画布上立刻能看到分格、能选中/拖动/缩放（包围盒仍来自 X-Element-Boxes）。
+ *   项目里**已经有素材**时，才走 kind=image 真正把图填进格子。
+ *
+ * 一个模板 = 一张「行 × 列权重」坐标表（见 TEMPLATES），
+ * 具体位置全部由 tplCells() 一套数学算出来 —— 不写 5 段重复代码，
+ * 也让左侧缩略图与真实生成的坐标**同源**（预览几格就是几格）。
+ *
+ * ★ 位置有讲究：这些 const 必须在下面的启动 IIFE **之前**求值。
+ *   const 提升但进 TDZ，boot() 里 bind() → mountTemplateUi() 会立刻用
+ *   TEMPLATES；写在启动之后就会 ReferenceError（见文件末尾钩子那段的教训）。
+ */
+
+//: 相邻两格之间留的缝（占画布宽/高的比例）。不留缝两格会连成一片，
+//  0.008 在 1400px 宽下约 11px —— 屏幕和印刷上都看得出分隔。
+const TPL_GAP = 0.008;
+
+//: 占位格样式：浅灰底 + 灰描边，和「已经放了图」明显区分，
+//  用户一眼就知道这里还等着填图。
+const TPL_FILL = '#e3e8ef';
+const TPL_LINE = '#64748b';
+const TPL_LINE_W = 0.005;
+
+/**
+ * 模板表。rows = 每一行的列权重：[[1]] 一行一格，[[1,1]] 一行两格，
+ * [[1],[1,1]] 两行、第二行两格。行高均分、列宽按权重均分，格间留 TPL_GAP。
+ * abbr 是按钮上的短名（左侧面板只有 232px 宽，长名字会被挤掉）。
+ */
+const TEMPLATES = [
+  { id: 'full',    name: '满版（1 格）', abbr: '满版',    rows: [[1]] },
+  { id: 'rows2',   name: '上下 2 格',    abbr: '上下2',   rows: [[1], [1]] },
+  { id: 'cols2',   name: '左右 2 格',    abbr: '左右2',   rows: [[1, 1]] },
+  { id: 'grid4',   name: '2×2 四格',     abbr: '2×2',     rows: [[1, 1], [1, 1]] },
+  { id: 'topWide', name: '上一下二',     abbr: '上一下二', rows: [[1], [1, 1]] },
+  { id: 'botWide', name: '上二下一',     abbr: '上二下一', rows: [[1, 1], [1]] },
+  { id: 'strip3',  name: '横条 3 格',    abbr: '横条3',   rows: [[1], [1], [1]] },
+  { id: 'grid6',   name: '2×3 六格',     abbr: '2×3',     rows: [[1, 1], [1, 1], [1, 1]] },
+];
+
+/**
+ * 权重列表 → 每段的 [起点, 长度]
+ * 总和铺满 0..1，段与段之间扣掉 gap（只有一段时没有缝，才不会平白缩水）。
+ */
+function tplSpans(weights, gap) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  const free = 1 - gap * (weights.length - 1);
+  const out = [];
+  let cur = 0;
+  weights.forEach(w => {
+    const len = free * w / total;
+    out.push([round(cur, 5), round(len, 5)]);
+    cur += len + gap;
+  });
+  return out;
+}
+
+/**
+ * 模板 → 格子坐标表 [{x, y, w, h}]
+ * 归一化坐标：w 相对画布宽、h 相对画布高（同 ShapeElement/ImageElement 语义）。
+ */
+function tplCells(tpl) {
+  const n = tpl.rows.length;
+  const ys = tplSpans(tpl.rows.map(() => 1), n > 1 ? TPL_GAP : 0);
+  const out = [];
+  tpl.rows.forEach((cols, i) => {
+    const xs = tplSpans(cols, cols.length > 1 ? TPL_GAP : 0);
+    xs.forEach(([x, w]) => out.push({ x, y: ys[i][0], w, h: ys[i][1] }));
+  });
+  return out;
+}
+
+/** 模板按钮：缩略图里的格子用的是 tplCells() 的真实坐标，图和结果不会不一致 */
+function tplMini(tpl, big) {
+  const b = el('button', 'tpl-mini' + (big ? ' big' : ''));
+  b.dataset.tpl = tpl.id;
+  b.title = tpl.name + '　点击套用到当前页';
+  const th = el('div', 'tpl-thumb');
+  tplCells(tpl).forEach(c => {
+    const d = el('div', 'tpl-cell');
+    d.style.cssText = `left:${c.x * 100}%;top:${c.y * 100}%;`
+      + `width:${c.w * 100}%;height:${c.h * 100}%`;
+    th.appendChild(d);
+  });
+  b.appendChild(th);
+  b.appendChild(el('span', 'tpl-cap', tpl.abbr));
+  b.onclick = () => applyTemplate(tpl);
+  return b;
+}
+
+/** 素材数 / 当前页元素数变了，勾选项的文字和可用状态要跟着变 */
+function refreshTemplateUi() {
+  const f = $('#tplFill');
+  const c = $('#tplClear');
+  const n = (S.proj && S.proj.assets) ? S.proj.assets.length : 0;
+  if (f) {
+    f.disabled = !n;
+    if (!n) f.checked = false;
+    const sp = f.parentElement.querySelector('span');
+    if (sp) sp.textContent = n ? `按顺序填入素材（${n} 张）` : '按顺序填入素材（无素材）';
+    f.parentElement.title = n ? '按素材列表顺序逐格填入真实图片' : '还没有素材，先上传图片';
+  }
+  if (c) {
+    const m = S.page ? S.page.elements.length : 0;
+    c.disabled = !m;
+    if (!m) c.checked = false;
+    const sp = c.parentElement.querySelector('span');
+    if (sp) sp.textContent = m ? `先清空这一页（${m} 个元素）` : '先清空这一页';
+  }
+}
+
+/**
+ * 套用模板：把当前页变成 N 个分格
+ * @param {object} tpl TEMPLATES 里的一项
+ *
+ * ★ 不是原子操作：服务端没有「批量加元素」接口，只能一格一格 POST。
+ *   第 3 格失败时前 2 格已经落在服务端了 —— 所以失败也要重新拉一遍项目、
+ *   把界面刷成服务端的真实状态，并把失败处告诉用户，而不是假装成功。
+ */
+async function applyTemplate(tpl) {
+  if (!S.page) { toast('先新建一页，再套用模板'); return; }
+  if (S.busy) { toast('正在忙，稍等一下'); return; }
+
+  const cells = tplCells(tpl);
+  const pageId = S.page.id;
+  const oldCount = S.page.elements.length;
+  const fillBox = $('#tplFill');
+  const clrBox = $('#tplClear');
+  const wantFill = !!(fillBox && fillBox.checked && !fillBox.disabled);
+  const wantClear = !!(oldCount && clrBox && clrBox.checked && !clrBox.disabled);
+  const assets = wantFill ? (S.proj.assets || []).slice() : [];
+
+  // ★ 整页排版会被改掉，已有元素必须先问一句 —— 用户排好的东西不能悄悄被盖掉
+  if (oldCount) {
+    const how = wantClear
+      ? `会先删掉这一页已有的 ${oldCount} 个元素`
+      : `新分格垫在这些元素下面（不删除它们）`;
+    if (!confirm(`套用「${tpl.name}」：生成 ${cells.length} 个分格。\n${how}。继续？`)) {
+      status('已取消套用模板');
+      return;
+    }
+  }
+
+  S.busy = true;
+  const made = [];
+  const fails = [];
+  let filled = 0;
+  try {
+    // ① 勾了「先清空」才删。整批写操作都不带 revision：每一次写都会推高
+    //    服务端版本号，带同一份 revision 第二次就会 409 —— 与 addElement 一致。
+    if (wantClear) {
+      for (const e of S.page.elements.slice()) {
+        try {
+          await api(url(`/api/edit/projects/${S.proj.name}/elements/${e.id}`),
+            { method: 'DELETE' });
+        } catch (err) { fails.push(`删掉「${label(e)}」：${err.message}`); }
+      }
+    }
+
+    // ② 一格一格建：有素材且勾了填入 → kind=image 真填图；
+    //    否则 kind=shape 占位框（原因见本节顶部注释）。
+    for (let i = 0; i < cells.length; i++) {
+      const c = cells[i];
+      const a = assets[i];
+      status(`生成分格 ${i + 1}/${cells.length}…`);
+      const body = a
+        ? { kind: 'image', asset_id: a.id, x: c.x, y: c.y, w: c.w, h: c.h,
+            props: { fit: 'cover' } }        // cover：填满格子且不变形（多余部分裁掉）
+        : { kind: 'shape', x: c.x, y: c.y, w: c.w, h: c.h,
+            props: { shape: 'rect', fill: TPL_FILL, line: TPL_LINE,
+              line_width: TPL_LINE_W, radius: 0, name: `分格 ${i + 1}` } };
+      try {
+        const r = await jpost(
+          `/api/edit/projects/${S.proj.name}/pages/${pageId}/elements`, body);
+        made.push(r.element.id);
+        if (a) filled++;
+      } catch (err) { fails.push(`第 ${i + 1} 格：${err.message}`); }
+    }
+
+    // ③ 上面是 N 次独立写，本地缓存已经不可信 —— 重新拉一遍服务端状态
+    S.proj = await api('/api/edit/projects/' + encodeURIComponent(S.proj.name));
+    S.revision = S.proj.revision != null ? S.proj.revision : null;
+    const pg = S.proj.pages.find(x => x.id === pageId);
+
+    // ④ 叠放顺序：分格是「底图」，必须垫在气泡/文字下面。
+    //    服务端建元素是 z = max+1，即新格子在最上层 —— 不调这一下，
+    //    用户已有的气泡会被新分格整个盖住。
+    if (pg && made.length && pg.elements.length > made.length) {
+      // 单独 try：顺序没调成不该连累「让用户看到已经建好的分格」这件事 ——
+      // 分格本身是好的，只是可能压在气泡上面，报出来让用户手动调一下即可。
+      try {
+        const byZ = pg.elements.slice()
+          .sort((a, b) => (a.z - b.z) || (a.id < b.id ? -1 : 1))
+          .map(x => x.id);
+        const others = byZ.filter(id => made.indexOf(id) < 0);
+        const order = made.concat(others);
+        const r = await jpost(`/api/edit/projects/${S.proj.name}/elements/order`,
+          { element_ids: order });
+        // ★ 顺序是改了服务端，但 S.proj 是上面 ③ 拉的**旧快照** —— 不在这里
+        //   跟上，图层面板会一直显示改之前的叠放顺序（看起来像「分格盖住了气泡」），
+        //   要等下次刷新才「跳」过来。以服务端回的 order 为准（从下到上）。
+        (r.order || order).forEach((id, i) => {
+          const e2 = pg.elements.find(x => x.id === id);
+          if (e2) e2.z = i;
+        });
+      } catch (err) {
+        fails.push(`分格没能垫到最下层（自行用 ↓ 下一层调整）：${err.message}`);
+      }
+    }
+
+    renderAssets();
+    renderPages();
+    await showPage(pageId);
+    // 选中刚生成的分格：一眼看到结果，也能直接整体挪/删
+    setSelection(made, made[0] || null);
+    refreshSel(); renderProps(); renderLayers();
+
+    if (fails.length) {
+      toast(`套用「${tpl.name}」有 ${fails.length} 处失败：${fails[0]}`, true);
+    } else if (filled) {
+      toast(`已套用「${tpl.name}」：${made.length} 个分格，其中 ${filled} 格已填入素材`);
+    } else {
+      toast(`已套用「${tpl.name}」：${made.length} 个分格（占位框，拖图进去即可）`);
+    }
+  } catch (e) {
+    toast('套用模板失败：' + e.message, true);
+  } finally {
+    S.busy = false; status(''); refreshTemplateUi();
+  }
+}
+
+/** 左侧「页面」标签页里的模板区。
+ *  editor.html 不在本次改动范围内，所以这里动态注入（而不是改 HTML）。 */
+function mountTemplateUi() {
+  const host = $('#tab-pages');
+  if (!host || $('#tplSec')) return;
+
+  const sec = el('div', 'tpl-sec');
+  sec.id = 'tplSec';
+  const head = el('div', 'sec-head');
+  head.appendChild(el('span', '', '页面模板'));
+  head.appendChild(el('span', 'tpl-hint', '点一下套用'));
+  sec.appendChild(head);
+
+  const grid = el('div', 'tpl-grid');
+  TEMPLATES.forEach(t => grid.appendChild(tplMini(t, false)));
+  sec.appendChild(grid);
+
+  // 「已有元素怎么办」做成显式勾选，而不是自作主张
+  const mkChk = (id, txt, title) => {
+    const l = el('label', 'chk');
+    const i = el('input'); i.type = 'checkbox'; i.id = id; i.title = title;
+    l.appendChild(i); l.appendChild(el('span', '', txt));
+    return l;
+  };
+  sec.appendChild(mkChk('tplFill', '按顺序填入素材',
+    '有素材时，按素材列表顺序逐格填入真实图片；素材不够则剩下的空格仍是占位框'));
+  sec.appendChild(mkChk('tplClear', '先清空这一页', '套用前删掉这一页已有的元素'));
+  sec.appendChild(el('div', 'hint',
+    '分格是浅灰占位框，从左侧把图拖上去即可。'));
+
+  const list = $('#pageList');
+  if (list) host.insertBefore(sec, list); else host.appendChild(sec);
+  refreshTemplateUi();
+}
+
+/** 空白页里的模板入口：新页最需要的就是先有个分格骨架 */
+function mountEmptyTemplates() {
+  const slot = $('#ecTplSlot');
+  if (!slot || slot.childNodes.length) return;
+  slot.appendChild(el('div', 'ec-tpl-title', '或者先套一个分格模板：'));
+  const row = el('div', 'ec-tpl-row');
+  TEMPLATES.forEach(t => row.appendChild(tplMini(t, true)));
+  slot.appendChild(row);
+}
+
+/* ══════════════════════════════════════════════════
  * 启动
  * ══════════════════════════════════════════════════ */
 (async function boot() {
@@ -1840,9 +2133,32 @@ function bind() {
   }
 })();
 
+/* ══════════════════════════════════════════════════════════════════
+   截图验证钩子（开发用）
+
+   为什么需要：命令行里点不了鼠标，而「多选参考线 / 裁剪框 / 分格模板」
+   这些东西光看代码没法自证 —— 必须让浏览器真的画出来再截图看。
+
+   用法（带上参数才生效）：
+     ?_demo=guides              全选并显示对齐参考线
+     ?_demo=crop                进裁剪模式（&apply=1 再提交，&flip=1 走镜像）
+     ?_demo=template            套分格模板（&tpl=grid4|all，&force=1 覆盖确认）
+
+   ★ 安全闸：只在 localhost 生效。
+     这些钩子会**真的改项目数据**，公开 Demo 上留着的话，
+     别人拼一个 URL 就能改你的项目。
+
+   ★ 这个 const 必须写在下面所有钩子**之前**：
+     const 会提升但进 TDZ，写在钩子后面的话，第一行 `if (DEMO_MODE === …)`
+     当场抛 ReferenceError，顶层脚本就此中断 ——
+     后面的钩子连同这行声明自己都不会执行（实测 guides / crop 两个钩子全废）。
+   ══════════════════════════════════════════════════════════════════ */
+const DEMO_MODE = ['localhost', '127.0.0.1', '::1'].includes(location.hostname)
+  ? new URLSearchParams(location.search).get('_demo') : null;
+
 /* ── 仅用于截图验证：?_demo=guides 时自动全选并显示参考线 ──
    这是临时钩子，不影响正常使用。 */
-if (new URLSearchParams(location.search).get('_demo') === 'guides') {
+if (DEMO_MODE === 'guides') {
   setTimeout(() => {
     if (!S.page) return;
     setSelection(S.page.elements.map(x => x.id), null);
@@ -1863,7 +2179,7 @@ if (new URLSearchParams(location.search).get('_demo') === 'guides') {
    （apply=1 时再按「完成」，用来验证服务端真的按新 crop 重画了）。
    同时把框位置 / 算出的 crop 写进隐藏的 #cropDbg，方便 --dump-dom 取数核对。
    临时钩子，不影响正常使用。 */
-if (new URLSearchParams(location.search).get('_demo') === 'crop') {
+if (DEMO_MODE === 'crop') {
   const q = new URLSearchParams(location.search);
   setTimeout(async () => {
     const found = S.page && S.page.elements.find(x => x.kind === 'image');
@@ -1925,5 +2241,64 @@ if (new URLSearchParams(location.search).get('_demo') === 'crop') {
       await new Promise(r => setTimeout(r, 1500));
       toast('演示：已应用裁剪');
     }
+  }, 2500);
+}
+
+/* ── 仅用于截图验证：?_demo=template[&tpl=grid4|all|none][&force=1]
+      [&tab=pages][&fill=1][&clear=1] ──
+   命令行里点不了鼠标，所以这里点的是**真实的模板按钮**（走 applyTemplate 全流程：
+   confirm → 逐格 POST → order → 重拉项目 → 选中）。
+   tpl=all 时每个模板各建一页 —— 一次浏览器跑完，验证整张模板表。
+   tpl=none 只切标签页不套模板，用来拍空白页的入口。
+   force=1 时把 confirm 放行（headless 里对话框会把人挂住，否则什么都验不到）。
+   结果写进隐藏的 #tplDbg，方便 --dump-dom 取数核对。临时钩子，不影响正常使用。 */
+if (DEMO_MODE === 'template') {
+  const q = new URLSearchParams(location.search);
+  const want = q.get('tpl') || 'grid4';
+  if (q.get('force') === '1') window.confirm = () => true;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  setTimeout(async () => {
+    if (!S.page) { toast('演示：还没有页面', true); return; }
+    // 「按顺序填入素材」「先清空这一页」也各留一个开关：前者踩 asset_id 约束、
+    // 后者会删数据，这两条分支必须能真跑一遍，不能只靠读代码相信它。
+    if (q.get('fill') === '1') {
+      const c = $('#tplFill'); if (c && !c.disabled) c.checked = true;
+    }
+    if (q.get('clear') === '1') {
+      const c = $('#tplClear'); if (c && !c.disabled) c.checked = true;
+    }
+    const ids = want === 'all' ? TEMPLATES.map(t => t.id)
+      : want === 'none' ? [] : [want];
+    const records = [];
+    for (const id of ids) {
+      if (records.length) await addPage();     // 每个模板一张干净的新页
+      const btn = document.querySelector(`.tpl-mini[data-tpl="${id}"]`);
+      if (!btn) { records.push({ tpl: id, error: '找不到模板按钮' }); continue; }
+      const before = S.page.elements.length;
+      btn.click();
+      // 等真实流程跑完：元素数变了就说明建好了（失败则超时，下面如实报出来）
+      for (let i = 0; i < 80 && S.page.elements.length === before; i++) await sleep(250);
+      await sleep(500);
+      records.push({
+        tpl: id, page: S.page.id, page_no: S.page.number,
+        elements: S.page.elements.map(e => ({
+          id: e.id, kind: e.kind, name: e.name || '',
+          x: e.x, y: e.y, w: e.w, h: e.h, z: e.z,
+        })),
+      });
+    }
+    // 切到「页面」标签页，截图里才看得到模板选择区
+    if (q.get('tab') === 'pages') {
+      const tb = document.querySelector('.panel.left .tab[data-tab="pages"]');
+      if (tb) tb.click();
+    }
+    await sleep(800);
+    const dbg = document.createElement('pre');
+    dbg.id = 'tplDbg';
+    dbg.hidden = true;
+    dbg.textContent = JSON.stringify({ demo: 'template', records });
+    document.body.appendChild(dbg);
+    status(`模板演示：${records.length} 个模板，当前页共 `
+      + `${S.page.elements.length} 个元素`);
   }, 2500);
 }

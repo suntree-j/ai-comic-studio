@@ -68,6 +68,20 @@ class ImageError(RuntimeError):
 
 
 class QuotaExceeded(ImageError):
+    """额度真的用完了（充钱才行）—— 重试没意义，该停就停"""
+
+
+class RateLimited(ImageError):
+    """**临时**限流（每分钟请求数超了）—— 等一会儿就能过
+
+    ★ 为什么和 QuotaExceeded 分开：
+      实测硅基流动返回
+        {"code":50604,"message":"... IPM limit reached."}
+      这是「你这一分钟发太多了」，不是「你没钱了」。
+      一开始两者共用一个异常，于是 9 格里第 8 格撞上限流 →
+      整个循环 break → 最后 2 格直接不生成。
+      真正该做的是等一下再试。
+    """
     """额度耗尽 —— 调用方可据此暂停重试"""
 
 
@@ -179,9 +193,20 @@ def _img_from_bytes(b: bytes) -> Image.Image:
 
 
 def _check_quota(status: int, text: str) -> None:
+    """区分「临时限流」与「额度用尽」
+
+    这是踩出来的：两者混在一起时，一次 IPM 限流会让整批生成停下。
+    """
     low = (text or "").lower()
-    if status == 429 or "quota" in low or "exceeded" in low or "限流" in text:
-        raise QuotaExceeded(f"额度或频率超限（HTTP {status}）：{text[:300]}")
+    # 临时限流：429，或报文里明确说是频率
+    if status == 429 or "rate limit" in low or "ipm limit" in low \
+            or "tpm limit" in low or "too many requests" in low \
+            or "限流" in text or "频率" in text:
+        raise RateLimited(f"被限流（HTTP {status}）：{text[:300]}")
+    # 额度用尽：充钱才行，重试没意义
+    if "quota" in low or "insufficient" in low or "balance" in low \
+            or "余额" in text or "额度不足" in text:
+        raise QuotaExceeded(f"额度不足（HTTP {status}）：{text[:300]}")
 
 
 # ══════════════════════════════════════════════════════════════════

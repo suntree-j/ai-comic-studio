@@ -231,3 +231,170 @@ def test_snap_disabled_while_shift_selecting():
     i = src.index("function startDrag(")
     head = src[i:i + 700]
     assert "ev.shiftKey" in head and "return" in head
+
+
+# ══════════════════════════════════════════════════════════════════
+# 页面模板：分格几何
+# ══════════════════════════════════════════════════════════════════
+
+def _tpl_run(body: str) -> subprocess.CompletedProcess:
+    """在 node 里跑真实的 TEMPLATES / tplSpans / tplCells
+
+    ★ 从 editor.js 里**抠出真代码**来跑，不是复制一份 ——
+      复制品测不出「改了实现忘了改测试」。
+    """
+    if not NODE:
+        pytest.skip("需要 node")
+    src = open(JS, encoding="utf-8").read()
+    prelude = """
+const TPL_GAP = 0.008;
+const round = (v, p = 4) => Math.round(v * 10 ** p) / 10 ** p;
+"""
+    # TEMPLATES 是 const 数组字面量，用括号配平抠出来
+    i = src.index("const TEMPLATES = [")
+    j = src.index("];", i) + 2
+    templates = src[i:j]
+    fns = "\n".join(_grab(f, src) for f in ("tplSpans", "tplCells"))
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"_tpl_{abs(hash(body)) % 10 ** 8}.mjs")
+    open(tmp, "w", encoding="utf-8").write(
+        prelude + templates + "\n" + fns + "\n" + body)
+    try:
+        return subprocess.run([NODE, tmp], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=60)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _tpl_json(body: str):
+    import json
+    r = _tpl_run(body)
+    assert r.returncode == 0, (r.stderr or "")[:500]
+    return json.loads(r.stdout.strip())
+
+
+def test_template_count_and_ids():
+    d = _tpl_json("""
+console.log(JSON.stringify(TEMPLATES.map(t => [t.id, t.name, t.rows.length,
+  t.rows.reduce((a, r) => a + r.length, 0)])));
+""")
+    ids = [x[0] for x in d]
+    assert len(ids) == len(set(ids)), "模板 id 有重复"
+    assert len(ids) >= 5, f"至少要 5 种模板，只有 {len(ids)}"
+    for tid, name, _rows, cells in d:
+        assert name, f"{tid} 没名字"
+        assert cells >= 1
+
+
+def test_all_templates_stay_inside_canvas():
+    """每一格都必须在 0..1 里 —— 越界会渲染到画布外，用户看不见还删不掉"""
+    d = _tpl_json("""
+const out = {};
+TEMPLATES.forEach(t => {
+  out[t.id] = tplCells(t).map(c => [c.x, c.y, c.w, c.h]);
+});
+console.log(JSON.stringify(out));
+""")
+    for tid, cells in d.items():
+        for k, (x, y, w, h) in enumerate(cells):
+            assert -1e-9 <= x and x + w <= 1 + 1e-9, \
+                f"{tid} 第{k+1}格 横向越界：x={x} w={w}"
+            assert -1e-9 <= y and y + h <= 1 + 1e-9, \
+                f"{tid} 第{k+1}格 纵向越界：y={y} h={h}"
+            assert w > 0 and h > 0, f"{tid} 第{k+1}格 尺寸非正"
+
+
+def test_all_templates_have_no_overlap():
+    """格子之间不能重叠 —— 重叠的格子会互相盖住，用户摆图时会莫名其妙"""
+    d = _tpl_json("""
+const EPS = 1e-9;
+const out = {};
+TEMPLATES.forEach(t => {
+  const cs = tplCells(t);
+  let bad = null;
+  for (let i = 0; i < cs.length && !bad; i++) {
+    for (let j = i + 1; j < cs.length; j++) {
+      const a = cs[i], b = cs[j];
+      const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ox > EPS && oy > EPS) {
+        bad = { i, j, ox, oy };
+        break;
+      }
+    }
+  }
+  out[t.id] = bad;
+});
+console.log(JSON.stringify(out));
+""")
+    for tid, bad in d.items():
+        assert bad is None, f"{tid} 的格子重叠了：{bad}"
+
+
+def test_multi_cell_templates_have_gap():
+    """多格之间要留缝（漫画分格的白边），且缝宽等于 TPL_GAP"""
+    d = _tpl_json("""
+const out = {};
+TEMPLATES.forEach(t => {
+  const cs = tplCells(t);
+  if (cs.length < 2) { out[t.id] = null; return; }
+  // 相邻两格之间的最小缝隙
+  let best = 1;
+  for (let i = 0; i < cs.length; i++) {
+    for (let j = i + 1; j < cs.length; j++) {
+      const a = cs[i], b = cs[j];
+      const dx = Math.max(b.x - (a.x + a.w), a.x - (b.x + b.w));
+      const dy = Math.max(b.y - (a.y + a.h), a.y - (b.y + b.h));
+      const gap = Math.max(dx, dy, 0);
+      if (gap > 1e-9) best = Math.min(best, gap);
+    }
+  }
+  out[t.id] = best;
+});
+console.log(JSON.stringify(out));
+""")
+    for tid, gap in d.items():
+        if gap is None:
+            continue
+        assert abs(gap - 0.008) < 0.002, \
+            f"{tid} 的格间缝隙是 {gap:.4f}，应接近 0.008"
+
+
+def test_single_cell_template_fills_canvas():
+    """满版必须正好铺满，不能平白缩水"""
+    d = _tpl_json("""
+const t = TEMPLATES.find(x => x.id === 'full');
+console.log(JSON.stringify(tplCells(t)));
+""")
+    assert len(d) == 1
+    c = d[0]
+    assert abs(c["x"]) < 1e-9 and abs(c["y"]) < 1e-9
+    assert abs(c["w"] - 1) < 1e-9 and abs(c["h"] - 1) < 1e-9
+
+
+def test_template_cell_counts():
+    """每个模板的格数要和名字里写的一致（名字骗人是低级错）"""
+    d = _tpl_json("""
+const out = {};
+TEMPLATES.forEach(t => { out[t.id] = tplCells(t).length; });
+console.log(JSON.stringify(out));
+""")
+    expect = {"full": 1, "rows2": 2, "cols2": 2, "grid4": 4,
+              "topWide": 3, "botWide": 3, "strip3": 3, "grid6": 6}
+    for tid, n in expect.items():
+        if tid in d:
+            assert d[tid] == n, f"{tid} 应该有 {n} 格，实际 {d[tid]}"
+
+
+def test_template_source_uses_one_table():
+    """结构保证：一个坐标表 + 一个生成器，不要 N 段重复代码"""
+    src = open(JS, encoding="utf-8").read()
+    assert "const TEMPLATES = [" in src
+    assert "function tplCells(" in src and "function tplSpans(" in src
+    # 缩略图必须用同一份坐标，否则预览和结果会不一致
+    i = src.index("function tplMini(")
+    j = src.index("\nfunction ", i + 10)
+    assert "tplCells(" in src[i:j], "缩略图要用 tplCells 的真实坐标"

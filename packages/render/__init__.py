@@ -15,6 +15,7 @@ from .providers import (
     ImageResult,
     ImageError,
     QuotaExceeded,
+    RateLimited,
     MockImageProvider,
     SeedreamProvider,
     OpenAIImagesProvider,
@@ -65,7 +66,7 @@ from .export import save_pdf, save_pdf_pymupdf, save_long_image, save_long_image
 from .studio import RenderStudio, RenderReport
 
 __all__ = [
-    "ImageProvider", "ImageRequest", "ImageResult", "ImageError", "QuotaExceeded",
+    "ImageProvider", "ImageRequest", "ImageResult", "ImageError", "QuotaExceeded", "RateLimited",
     "MockImageProvider", "SeedreamProvider", "OpenAIImagesProvider",
     "SDWebUIProvider", "GenericHTTPProvider",
     "get_image_provider", "IMAGE_PROVIDER_NAMES", "KNOWN_SIZES",

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -37,6 +38,7 @@ from .providers import (
     ImageProvider,
     ImageRequest,
     QuotaExceeded,
+    RateLimited,
 )
 
 
@@ -58,10 +60,17 @@ class RenderStudio:
 
     def __init__(self, provider: ImageProvider,
                  panel_width: int = 2480,
-                 base_font: int = 46):
+                 base_font: int = 46,
+                 rate_retries: int = 3,
+                 rate_backoff: float = 20.0):
         self.provider = provider
         self.panel_width = panel_width
         self.base_font = base_font
+        #: 被限流时重试几次、每次等多久（秒）
+        #: 实测硅基流动的 IPM 限流等 20-60s 就能过，
+        #: 直接 break 会把后面本来能生成的格子全丢掉。
+        self.rate_retries = rate_retries
+        self.rate_backoff = rate_backoff
 
     # ── 素材 ──────────────────────────────────────────────────
     @staticmethod
@@ -99,27 +108,58 @@ class RenderStudio:
                 ref_images=(refs_of(p) if refs_of else []),
                 negative=build_negative(p),
             )
-            try:
-                res = self.provider.generate_to_file(req, out)
-                if res.ok:
-                    rep.generated += 1
-                    if on_progress:
-                        on_progress(i, total, f"{p.id} 已生成 {res.latency_ms}ms")
-                else:                                       # pragma: no cover
-                    rep.failed += 1
-                    rep.errors.append(f"{p.id}: provider 返回空图")
-            except QuotaExceeded as e:
-                rep.failed += 1
-                rep.errors.append(f"{p.id}: 额度超限 —— {e}")
-                if stop_on_quota:
-                    if on_progress:
-                        on_progress(i, total, "额度超限，停止")
+            # ★ 限流要**等一下再试**，不是整批停下。
+            #   实测撞过硅基流动的 IPM 限流：9 格跑到第 8 格被拒，
+            #   一停就白丢最后 2 格。限流是临时的，等一会儿就能过。
+            res = None
+            last_rate_err: Optional[Exception] = None
+            for rl_try in range(self.rate_retries + 1):
+                try:
+                    res = self.provider.generate_to_file(req, out)
                     break
-            except ImageError as e:
+                except RateLimited as e:
+                    last_rate_err = e
+                    if rl_try >= self.rate_retries:
+                        break
+                    wait = self.rate_backoff * (rl_try + 1)
+                    if on_progress:
+                        on_progress(i, total,
+                                    f"{p.id} 被限流，等 {wait:.0f}s 再试")
+                    time.sleep(wait)
+                except QuotaExceeded as e:
+                    rep.failed += 1
+                    rep.errors.append(f"{p.id}: 额度不足 —— {e}")
+                    if stop_on_quota:
+                        if on_progress:
+                            on_progress(i, total, "额度不足，停止")
+                        return rep
+                    res = None
+                    break
+                except ImageError as e:
+                    rep.failed += 1
+                    rep.errors.append(f"{p.id}: {e}")
+                    if on_progress:
+                        on_progress(i, total, f"{p.id} 失败：{e}")
+                    res = None
+                    break
+
+            if last_rate_err is not None and res is None:
                 rep.failed += 1
-                rep.errors.append(f"{p.id}: {e}")
+                rep.errors.append(
+                    f"{p.id}: 重试 {self.rate_retries} 次仍被限流 —— "
+                    f"{last_rate_err}")
                 if on_progress:
-                    on_progress(i, total, f"{p.id} 失败：{e}")
+                    on_progress(i, total, f"{p.id} 仍被限流")
+                continue
+            if res is None:
+                continue
+            if res.ok:
+                rep.generated += 1
+                if on_progress:
+                    on_progress(i, total, f"{p.id} 已生成 {res.latency_ms}ms")
+            else:                                           # pragma: no cover
+                rep.failed += 1
+                rep.errors.append(f"{p.id}: provider 返回空图")
         return rep
 
     # ── 合成页面 ──────────────────────────────────────────────

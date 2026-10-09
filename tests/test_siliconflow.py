@@ -13,7 +13,8 @@ import pytest
 
 from packages.render.providers import (
     IMAGE_PROVIDER_NAMES, SF_MAX_PIXELS, SF_SIZE_MAP,
-    ImageError, ImageRequest, QuotaExceeded, SiliconFlowProvider,
+    ImageError, ImageRequest, QuotaExceeded, RateLimited,
+    SiliconFlowProvider,
     get_image_provider,
 )
 
@@ -224,12 +225,51 @@ def test_pixel_limit_error_is_surfaced(fake):
         prov.generate(ImageRequest(prompt="p"))
 
 
-def test_quota_detected(fake):
+def test_rate_limit_is_distinct_from_quota(fake):
+    """★ 回归：429「限流」必须和「额度用尽」分开
+
+    实测撞过硅基流动的 IPM 限流：
+    `{"code":50604,"message":"... IPM limit reached."}`
+    这是「你这一分钟发太多了」，等一会儿就能过，
+    不是「你没钱了」。
+
+    一开始两者共用一个异常，于是 9 格里第 8 格撞上限流 →
+    整个生成循环 break → 最后 2 格直接不生成。
+    现在分开：限流会退避重试，额度不足才停。
+    """
     fake(FakeResp(429, {"message": "rate limit exceeded"},
                   text='{"message":"rate limit exceeded"}'))
     prov = SiliconFlowProvider(api_key="sk")
+    with pytest.raises(RateLimited):
+        prov.generate(ImageRequest(prompt="p"))
+
+
+def test_siliconflow_ipm_message_is_rate_limit(fake):
+    """硅基流动的真实限流报文（IPM limit reached）"""
+    fake(FakeResp(429, {"code": 50604,
+                        "message": "Request was rejected due to rate "
+                                   "limiting. Details: IPM limit reached."},
+                  text='{"code":50604,"message":"IPM limit reached."}'))
+    prov = SiliconFlowProvider(api_key="sk")
+    with pytest.raises(RateLimited):
+        prov.generate(ImageRequest(prompt="p"))
+
+
+def test_quota_exhausted_detected(fake):
+    """额度真的用完了 → QuotaExceeded（重试没意义）"""
+    fake(FakeResp(402, {"message": "insufficient balance"},
+                  text='{"message":"insufficient balance"}'))
+    prov = SiliconFlowProvider(api_key="sk")
     with pytest.raises(QuotaExceeded):
         prov.generate(ImageRequest(prompt="p"))
+
+
+def test_rate_limited_is_image_error():
+    """两个异常都得是 ImageError 的子类（上层统一兜底），但互不包含"""
+    assert issubclass(RateLimited, ImageError)
+    assert issubclass(QuotaExceeded, ImageError)
+    assert not issubclass(RateLimited, QuotaExceeded)
+    assert not issubclass(QuotaExceeded, RateLimited)
 
 
 def test_download_failure_raises(fake):
